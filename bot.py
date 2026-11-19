@@ -16,17 +16,15 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 RUN_ID = str(uuid.uuid4())[:8]
 
-# تنظیمات سرمایه و مدیریت ریسک (تست آزمایشی با داده واقعی)
 INITIAL_TON_BALANCE = float(os.environ.get("INITIAL_TON_BALANCE", "1000.0"))
-TRADE_ALLOCATION_PCT = float(os.environ.get("TRADE_ALLOCATION_PCT", "0.10"))  # 10% موجودی در هر معامله
-FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))  # کارمزد فرضی هر سمت سواب (0.2%)
+TRADE_ALLOCATION_PCT = float(os.environ.get("TRADE_ALLOCATION_PCT", "0.10"))
+FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "2.5"))
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-1.5"))
 BREAKEVEN_TRIGGER_PCT = float(os.environ.get("BREAKEVEN_TRIGGER_PCT", "1.0"))
 TRAILING_STOP_PCT = float(os.environ.get("TRAILING_STOP_PCT", "0.8"))
 COOLDOWN_CYCLES = int(os.environ.get("COOLDOWN_CYCLES", "3"))
 
-# توکن‌های شبکه TON با شناسه واقعی CoinGecko و/یا آدرس قرارداد Jetton در شبکه TON
 TOKENS = {
     "NOT": {
         "coingecko_id": "notcoin",
@@ -63,6 +61,7 @@ balance_ton = INITIAL_TON_BALANCE
 open_position = None
 closed_trades = []
 cooldown_remaining = 0
+polling_thread = None
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -77,8 +76,11 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        server.serve_forever()
+    except Exception as e:
+        print("Web server error:", e)
 
 
 def send_telegram_message(text: str, chat_id: str = None):
@@ -93,7 +95,7 @@ def send_telegram_message(text: str, chat_id: str = None):
         "parse_mode": "HTML",
     }
     try:
-        res = requests.post(url, json=payload, timeout=15)
+        res = requests.post(url, json=payload, timeout=10)
         if res.status_code != 200:
             print("Telegram error:", res.status_code, res.text[:200])
         return res.status_code == 200
@@ -103,10 +105,8 @@ def send_telegram_message(text: str, chat_id: str = None):
 
 
 def fetch_real_ton_price():
-    """دریافت قیمت واقعی TON به USD از CoinGecko یا GeckoTerminal (بدون مقدار فرضی)"""
     global ton_price_usd, ton_change_24h, last_ton_fetch_time
 
-    # منبع ۱: CoinGecko
     try:
         url = "https://api.coingecko.com/api/v3/simple/price"
         params = {
@@ -114,7 +114,7 @@ def fetch_real_ton_price():
             "vs_currencies": "usd",
             "include_24hr_change": "true",
         }
-        res = requests.get(url, params=params, timeout=15)
+        res = requests.get(url, params=params, timeout=10)
         res.raise_for_status()
         data = res.json().get("the-open-network")
         if data and data.get("usd"):
@@ -125,10 +125,9 @@ def fetch_real_ton_price():
     except Exception as e:
         print("CoinGecko TON error:", e)
 
-    # منبع ۲: GeckoTerminal (استخر TON روی شبکه ton)
     try:
         url_gt = "https://api.geckoterminal.com/api/v2/networks/ton/tokens/EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"
-        res_gt = requests.get(url_gt, headers={"Accept": "application/json"}, timeout=15)
+        res_gt = requests.get(url_gt, headers={"Accept": "application/json"}, timeout=10)
         res_gt.raise_for_status()
         attrs = res_gt.json().get("data", {}).get("attributes", {})
         if attrs.get("price_usd"):
@@ -142,10 +141,8 @@ def fetch_real_ton_price():
 
 
 def fetch_real_token_usd_prices():
-    """دریافت قیمت واقعی دلاری توکن‌ها از CoinGecko و GeckoTerminal (فقط داده واقعی)"""
     usd_prices = {}
 
-    # ۱. CoinGecko
     cg_map = {
         info["coingecko_id"]: sym
         for sym, info in TOKENS.items()
@@ -155,7 +152,7 @@ def fetch_real_token_usd_prices():
         try:
             url = "https://api.coingecko.com/api/v3/simple/price"
             params = {"ids": ",".join(cg_map.keys()), "vs_currencies": "usd"}
-            res = requests.get(url, params=params, timeout=15)
+            res = requests.get(url, params=params, timeout=10)
             if res.status_code == 200:
                 payload = res.json()
                 for cg_id, sym in cg_map.items():
@@ -165,14 +162,13 @@ def fetch_real_token_usd_prices():
         except Exception as e:
             print("CoinGecko tokens error:", e)
 
-    # ۲. تکمیل توکن‌های باقی‌مانده از GeckoTerminal با آدرس Jetton در شبکه TON
     missing_syms = [s for s in TOKENS if s not in usd_prices and TOKENS[s].get("jetton_address")]
     if missing_syms:
         addrs = ",".join(TOKENS[s]["jetton_address"].lower() for s in missing_syms)
         addr_to_sym = {TOKENS[s]["jetton_address"].lower(): s for s in missing_syms}
         try:
             url_gt = f"https://api.geckoterminal.com/api/v2/networks/ton/tokens/multi/{addrs}"
-            res_gt = requests.get(url_gt, headers={"Accept": "application/json"}, timeout=15)
+            res_gt = requests.get(url_gt, headers={"Accept": "application/json"}, timeout=10)
             if res_gt.status_code == 200:
                 items = res_gt.json().get("data", [])
                 for item in items:
@@ -188,7 +184,6 @@ def fetch_real_token_usd_prices():
 
 
 def update_real_market_data():
-    """به‌روزرسانی قیمت واقعی TON و توکن‌ها؛ بدون هیچ‌گونه داده شبیه‌سازی یا تصادفی"""
     ton_usd, _ = fetch_real_ton_price()
     if not ton_usd or ton_usd <= 0:
         return False
@@ -219,7 +214,6 @@ def calc_sma(values, period):
 
 
 def analyze_token_real(sym: str):
-    """تحلیل تکنیکال مبتنی بر سری قیمت واقعی ثبت‌شده"""
     hist = TOKENS[sym]["history_ton"]
     if len(hist) < 3:
         return 0, 0.0, "در انتظار جمع‌آوری کندل‌های واقعی بیشتر"
@@ -281,7 +275,6 @@ def process_trading_step():
         if not trading_enabled:
             return
 
-        # ۱. بررسی خروج روی پوزیشن باز با قیمت واقعی
         if open_position is not None:
             sym = open_position["symbol"]
             hist = TOKENS[sym]["history_ton"]
@@ -300,7 +293,7 @@ def process_trading_step():
             mode_tag = "حد ضرر اولیه"
 
             if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT:
-                be_floor = (FEE_RATE * 2 * 100.0) + 0.1  # پوشش کارمزد رفت و برگشت
+                be_floor = (FEE_RATE * 2 * 100.0) + 0.1
                 effective_sl = max(effective_sl, be_floor)
                 mode_tag = "نقطه سر‌به‌سر (Break-even)"
 
@@ -354,12 +347,10 @@ def process_trading_step():
                 send_telegram_message(msg)
             return
 
-        # ۲. دوره استراحت پس از ضرر
         if cooldown_remaining > 0:
             cooldown_remaining -= 1
             return
 
-        # ۳. بررسی سیگنال ورود روی قیمت‌های واقعی
         best_sym = None
         best_score = 2
         best_delta = 0.0
@@ -415,7 +406,6 @@ def process_trading_step():
 
 
 def get_total_equity_ton():
-    """محاسبه ارزش کل دارایی (موجودی نقد + ارزش لحظه‌ای پوزیشن باز)"""
     equity = balance_ton
     if open_position is not None:
         sym = open_position["symbol"]
@@ -440,11 +430,13 @@ def build_status_text():
         price_str = f"${ton_price_usd:.4f}" if ton_price_usd is not None else "در انتظار داده واقعی"
         mode_str = "🟢 روشن (در حال ترید)" if trading_enabled else "🔴 متوقف (قطع‌شده)"
         cd_str = f"{cooldown_remaining} چرخه" if cooldown_remaining > 0 else "خیر"
+        upd_str = last_ton_fetch_time or "نامشخص"
 
         return (
             f"📊 <b>وضعیت ربات تریدر TON (داده واقعی)</b> [<code>{RUN_ID}</code>]\n"
             f"⚙️ وضعیت ترید: <b>{mode_str}</b>\n"
             f"💵 قیمت واقعی TON: <b>{price_str}</b> (۲۴h: <code>{ton_change_24h:+.2f}%</code>)\n"
+            f"🕒 آخرین بروزرسانی قیمت: <code>{upd_str}</code>\n"
             f"💼 موجودی نقد: <b>{balance_ton:.4f} TON</b>\n"
             f"💎 ارزش کل دارایی (Equity): <b>{total_equity:.4f} TON</b> (<code>{total_return_pct:+.2f}%</code>)\n"
             f"📈 سود/ضرر خالص معاملات بسته: <code>{total_pnl:+.4f} TON</code>\n"
@@ -523,76 +515,91 @@ def reset_simulation():
         cooldown_remaining = 0
 
 
+def handle_command(cmd: str, chat_id: str):
+    global trading_enabled
+
+    if cmd in ("/start", "/help"):
+        send_telegram_message(
+            f"🤖 <b>ربات تریدر TON (داده واقعی و آمار دقیق)</b> [<code>{RUN_ID}</code>]\n"
+            "دستورات اصلی کنترل ترید:\n"
+            "• /trade_on (یا /run) — شروع و فعال‌سازی ترید\n"
+            "• /trade_off (یا /stop) — قطع فوری و توقف ترید\n\n"
+            "دستورات گزارش و آمار:\n"
+            "• /status — وضعیت کلی، موجودی و ارزش کل دارایی\n"
+            "• /stats — آمار دقیق سود/ضرر، نرخ برد و میانگین‌ها\n"
+            "• /positions — وضعیت پوزیشن باز\n"
+            "• /history — آخرین معاملات بسته\n"
+            "• /reset — ریست شبیه‌سازی به 1000 TON",
+            chat_id=chat_id,
+        )
+    elif cmd in ("/trade_on", "/run"):
+        with state_lock:
+            trading_enabled = True
+        send_telegram_message(
+            f"🟢 <b>عملیات ترید شروع شد!</b> [<code>{RUN_ID}</code>]\n"
+            "ربات فقط بر اساس قیمت‌های واقعی بازار تحلیل و معامله می‌کند.",
+            chat_id=chat_id,
+        )
+    elif cmd in ("/trade_off", "/stop"):
+        with state_lock:
+            trading_enabled = False
+        send_telegram_message(
+            f"🛑 <b>عملیات ترید متوقف شد!</b> [<code>{RUN_ID}</code>]\n"
+            "تمام عملیات ترید قطع شد تا دستور /trade_on ارسال شود.",
+            chat_id=chat_id,
+        )
+    elif cmd == "/status":
+        send_telegram_message(build_status_text(), chat_id=chat_id)
+    elif cmd == "/stats":
+        send_telegram_message(build_stats_text(), chat_id=chat_id)
+    elif cmd == "/positions":
+        send_telegram_message(build_positions_text(), chat_id=chat_id)
+    elif cmd == "/history":
+        send_telegram_message(build_history_text(), chat_id=chat_id)
+    elif cmd == "/reset":
+        reset_simulation()
+        send_telegram_message(
+            f"🔄 آمار و موجودی ریست شد. موجودی اولیه: <b>{INITIAL_TON_BALANCE:.2f} TON</b> [<code>{RUN_ID}</code>]",
+            chat_id=chat_id,
+        )
+
+
 def poll_telegram_updates():
-    global last_update_id, trading_enabled
+    global last_update_id
+    session = requests.Session()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {"offset": last_update_id + 1, "timeout": 20}
-            res = requests.get(url, params=params, timeout=30)
+            params = {"offset": last_update_id + 1, "timeout": 15}
+            res = session.get(url, params=params, timeout=25)
             if res.status_code == 200:
-                for upd in res.json().get("result", []):
-                    last_update_id = upd["update_id"]
-                    msg = upd.get("message") or {}
+                data = res.json()
+                for upd in data.get("result", []):
+                    upd_id = upd.get("update_id")
+                    if upd_id is not None and upd_id >= last_update_id:
+                        last_update_id = upd_id
+                    msg = upd.get("message") or upd.get("edited_message") or {}
                     text = (msg.get("text") or "").strip()
                     chat_id = str(msg.get("chat", {}).get("id", ""))
-                    if not chat_id:
+                    if not chat_id or not text:
                         continue
-
-                    cmd = text.split()[0].lower() if text else ""
-
-                    if cmd in ("/start", "/help"):
-                        send_telegram_message(
-                            f"🤖 <b>ربات تریدر TON (داده واقعی و آمار دقیق)</b> [<code>{RUN_ID}</code>]\n"
-                            "دستورات اصلی کنترل ترید:\n"
-                            "• /trade_on (یا /run) — شروع و فعال‌سازی ترید\n"
-                            "• /trade_off (یا /stop) — قطع فوری و توقف ترید\n\n"
-                            "دستورات گزارش و آمار:\n"
-                            "• /status — وضعیت کلی، موجودی و ارزش کل دارایی\n"
-                            "• /stats — آمار دقیق سود/ضرر، نرخ برد و میانگین‌ها\n"
-                            "• /positions — وضعیت پوزیشن باز\n"
-                            "• /history — آخرین معاملات بسته\n"
-                            "• /reset — ریست شبیه‌سازی به 1000 TON",
-                            chat_id=chat_id,
-                        )
-                    elif cmd in ("/trade_on", "/run"):
-                        with state_lock:
-                            trading_enabled = True
-                        send_telegram_message(
-                            f"🟢 <b>عملیات ترید شروع شد!</b> [<code>{RUN_ID}</code>]\n"
-                            "ربات فقط بر اساس قیمت‌های واقعی بازار تحلیل و معامله می‌کند.",
-                            chat_id=chat_id,
-                        )
-                    elif cmd in ("/trade_off", "/stop"):
-                        with state_lock:
-                            trading_enabled = False
-                        send_telegram_message(
-                            f"🛑 <b>عملیات ترید متوقف شد!</b> [<code>{RUN_ID}</code>]\n"
-                            "تمام عملیات ترید قطع شد تا دستور /trade_on ارسال شود.",
-                            chat_id=chat_id,
-                        )
-                    elif cmd == "/status":
-                        try:
-                            with state_lock:
-                                update_real_market_data()
-                        except Exception as e:
-                            print("Market update in /status failed:", e)
-                        send_telegram_message(build_status_text(), chat_id=chat_id)
-                    elif cmd == "/stats":
-                        send_telegram_message(build_stats_text(), chat_id=chat_id)
-                    elif cmd == "/positions":
-                        send_telegram_message(build_positions_text(), chat_id=chat_id)
-                    elif cmd == "/history":
-                        send_telegram_message(build_history_text(), chat_id=chat_id)
-                    elif cmd == "/reset":
-                        reset_simulation()
-                        send_telegram_message(
-                            f"🔄 آمار و موجودی ریست شد. موجودی اولیه: <b>{INITIAL_TON_BALANCE:.2f} TON</b> [<code>{RUN_ID}</code>]",
-                            chat_id=chat_id,
-                        )
+                    cmd = text.split()[0].split("@")[0].lower()
+                    handle_command(cmd, chat_id)
+            else:
+                print("getUpdates status:", res.status_code, res.text[:200])
+                time.sleep(3)
         except Exception as e:
-            print("Polling error:", e)
-        time.sleep(2)
+            print("Polling loop warning:", e)
+            time.sleep(3)
+        time.sleep(1)
+
+
+def ensure_polling_alive():
+    global polling_thread
+    if polling_thread is None or not polling_thread.is_alive():
+        polling_thread = threading.Thread(target=poll_telegram_updates, daemon=True)
+        polling_thread.start()
 
 
 def trading_loop():
@@ -605,6 +612,7 @@ def trading_loop():
     )
 
     while True:
+        ensure_polling_alive()
         try:
             process_trading_step()
         except Exception as e:
@@ -615,5 +623,5 @@ def trading_loop():
 
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
-    threading.Thread(target=poll_telegram_updates, daemon=True).start()
+    ensure_polling_alive()
     trading_loop()
