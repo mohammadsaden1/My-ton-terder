@@ -1,4 +1,4 @@
-import os
+rt os
 import time
 import uuid
 import threading
@@ -632,4 +632,4 @@ def trading_loop():
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
     ensure_polling_alive()
-    trading_loop()
+    trading_loop
