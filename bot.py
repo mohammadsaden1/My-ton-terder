@@ -16,15 +16,17 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 RUN_ID = str(uuid.uuid4())[:8]
 
+# تنظیمات سرمایه و مدیریت ریسک (تست آزمایشی با داده واقعی)
 INITIAL_TON_BALANCE = float(os.environ.get("INITIAL_TON_BALANCE", "1000.0"))
-TRADE_ALLOCATION_PCT = float(os.environ.get("TRADE_ALLOCATION_PCT", "0.10"))
-FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))
+TRADE_ALLOCATION_PCT = float(os.environ.get("TRADE_ALLOCATION_PCT", "0.10"))  # 10% موجودی در هر معامله
+FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))  # کارمزد فرضی هر سمت سواب (0.2%)
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "2.5"))
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-1.5"))
 BREAKEVEN_TRIGGER_PCT = float(os.environ.get("BREAKEVEN_TRIGGER_PCT", "1.0"))
 TRAILING_STOP_PCT = float(os.environ.get("TRAILING_STOP_PCT", "0.8"))
 COOLDOWN_CYCLES = int(os.environ.get("COOLDOWN_CYCLES", "3"))
 
+# توکن‌های شبکه TON
 TOKENS = {
     "NOT": {
         "coingecko_id": "notcoin",
@@ -105,6 +107,7 @@ def send_telegram_message(text: str, chat_id: str = None):
 
 
 def fetch_real_ton_price():
+    """دریافت قیمت واقعی TON به USD از CoinGecko یا GeckoTerminal (بدون مقدار فرضی)"""
     global ton_price_usd, ton_change_24h, last_ton_fetch_time
 
     try:
@@ -141,6 +144,7 @@ def fetch_real_ton_price():
 
 
 def fetch_real_token_usd_prices():
+    """دریافت قیمت واقعی دلاری توکن‌ها از CoinGecko و GeckoTerminal (فقط داده واقعی)"""
     usd_prices = {}
 
     cg_map = {
@@ -584,6 +588,11 @@ def poll_telegram_updates():
                     chat_id = str(msg.get("chat", {}).get("id", ""))
                     if not chat_id or not text:
                         continue
+
+                    # قفل امنیتی: فقط چت‌ایدی مالک ربات اجازه کنترل دارد
+                    if chat_id != TELEGRAM_CHAT_ID:
+                        continue
+
                     cmd = text.split()[0].split("@")[0].lower()
                     handle_command(cmd, chat_id)
             else:
@@ -604,8 +613,8 @@ def ensure_polling_alive():
 
 def trading_loop():
     send_telegram_message(
-        f"🚀 <b>ربات تریدر TON (حالت داده واقعی) آماده شد!</b> [<code>{RUN_ID}</code>]\n"
-        f"سرمایه تست: <b>{INITIAL_TON_BALANCE:.2f} TON</b> | بدون قیمت ساختگی یا نویز مصنوعی\n"
+        f"🚀 <b>ربات تریدر TON (حالت داده واقعی و امن) آماده شد!</b> [<code>{RUN_ID}</code>]\n"
+        f"سرمایه تست: <b>{INITIAL_TON_BALANCE:.2f} TON</b> | کنترل انحصاری برای مالک ربات فعال است\n"
         f"• شروع ترید: <code>/trade_on</code>\n"
         f"• قطع فوری ترید: <code>/trade_off</code>\n"
         f"• آمار دقیق: <code>/stats</code>"
