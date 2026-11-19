@@ -1,4 +1,4 @@
-rt os
+import os
 import time
 import uuid
 import threading
@@ -8,29 +8,34 @@ import requests
 
 DEFAULT_TOKEN = "9080285155:AAHuZFiALLtk9Sstk1jTFFZN0PwPLWFhgWM"
 DEFAULT_CHAT_ID = "1951133060"
+DEFAULT_WALLET = "UQAtgSONTV8ee_tciJBCPsr-LJEAlpeYFfAJ3y6JucBhZXLS"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", DEFAULT_TOKEN).strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", DEFAULT_CHAT_ID).strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
-# تایم‌فریم 5 دقیقه‌ای (300 ثانیه برای تشکیل هر کندل 5m)
+TONKEEPER_WALLET = os.environ.get("TONKEEPER_WALLET", DEFAULT_WALLET).strip()
+
+# برای حفظ امنیت: تراکنش واقعی غیرفعال است؛ ترید با موجودی فرضی انجام می‌شود
+LIVE_TRADING = False
+
+# تایم‌فریم 5 دقیقه‌ای (300s) با نمونه‌برداری سریع‌تر (20s) برای رصد دقیق‌تر قیمت واقعی
 TIMEFRAME_SECONDS = int(os.environ.get("TIMEFRAME_SECONDS", "300"))
-SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "60"))
+SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "20"))
 
 RUN_ID = str(uuid.uuid4())[:8]
 
-# تنظیمات سرمایه و ترید کوتاه با سود کم روی ارز NOT
+# تنظیمات سرمایه فرضی و ترید کوتاه روی ارز NOT
 INITIAL_TON_BALANCE = float(os.environ.get("INITIAL_TON_BALANCE", "1000.0"))
-TRADE_ALLOCATION_PCT = float(os.environ.get("TRADE_ALLOCATION_PCT", "0.10"))  # 10% موجودی در هر معامله
-FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))  # 0.2% کارمزد هر سمت
+TRADE_ALLOCATION_PCT = float(os.environ.get("TRADE_ALLOCATION_PCT", "0.10"))
+FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))
 
-TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "1.2"))  # هدف سود کوتاه +1.2%
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-0.85"))  # حد ضرر کوتاه -0.85%
-BREAKEVEN_TRIGGER_PCT = float(os.environ.get("BREAKEVEN_TRIGGER_PCT", "0.6"))  # فعال شدن سر‌به‌سر در +0.6%
-TRAILING_STOP_PCT = float(os.environ.get("TRAILING_STOP_PCT", "0.4"))  # تریلینگ کوتاه 0.4%
-COOLDOWN_CANDLES = int(os.environ.get("COOLDOWN_CANDLES", "2"))  # استراحت 2 کندل 5m پس از ضرر
+TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "1.2"))
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-0.85"))
+BREAKEVEN_TRIGGER_PCT = float(os.environ.get("BREAKEVEN_TRIGGER_PCT", "0.6"))
+TRAILING_STOP_PCT = float(os.environ.get("TRAILING_STOP_PCT", "0.4"))
+COOLDOWN_CANDLES = int(os.environ.get("COOLDOWN_CANDLES", "2"))
 
-# ارز اختصاصی: فقط NOT
 NOT_CONFIG = {
     "symbol": "NOT",
     "coingecko_id": "notcoin",
@@ -43,8 +48,12 @@ last_ton_fetch_time = None
 last_not_usd = None
 last_not_ton = None
 last_not_fetch_time = None
+last_price_source = None
 
-# کندل‌های 5 دقیقه‌ای بسته شده: هر آیتم {"open": ..., "high": ..., "low": ..., "close": ..., "ts": ...}
+wallet_real_ton = None
+wallet_real_not = None
+wallet_last_sync = None
+
 candles_5m = []
 current_candle = None
 
@@ -59,13 +68,15 @@ closed_trades = []
 cooldown_remaining = 0
 polling_thread = None
 
+http_session = requests.Session()
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(f"NOT 5m Scalper ({RUN_ID}) active".encode("utf-8"))
+        self.wfile.write(f"NOT 5m Fast-Feed ({RUN_ID}) active".encode("utf-8"))
 
     def log_message(self, format, *args):
         return
@@ -91,7 +102,7 @@ def send_telegram_message(text: str, chat_id: str = None):
         "parse_mode": "HTML",
     }
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = http_session.post(url, json=payload, timeout=8)
         if res.status_code != 200:
             print("Telegram error:", res.status_code, res.text[:200])
         return res.status_code == 200
@@ -100,8 +111,70 @@ def send_telegram_message(text: str, chat_id: str = None):
         return False
 
 
+def is_valid_ton_address(addr: str) -> bool:
+    if not addr:
+        return False
+    addr = addr.strip()
+    return len(addr) >= 40 and addr[:2] in ("EQ", "UQ", "kQ", "0Q")
+
+
+def sync_tonkeeper_wallet():
+    """دریافت موجودی واقعی TON و Jetton NOT کیف پول Tonkeeper از TonAPI (فقط نمایشی)"""
+    global wallet_real_ton, wallet_real_not, wallet_last_sync
+
+    with state_lock:
+        addr = TONKEEPER_WALLET
+
+    if not is_valid_ton_address(addr):
+        return False
+
+    try:
+        acc_url = f"https://tonapi.io/v2/accounts/{addr}"
+        acc_res = http_session.get(acc_url, timeout=8)
+        ton_bal = None
+        if acc_res.status_code == 200:
+            nano_bal = acc_res.json().get("balance")
+            if nano_bal is not None:
+                ton_bal = float(nano_bal) / 1e9
+
+        jetton_addr = NOT_CONFIG["jetton_address"]
+        j_url = f"https://tonapi.io/v2/accounts/{addr}/jettons/{jetton_addr}"
+        j_res = http_session.get(j_url, timeout=8)
+        not_bal = None
+        if j_res.status_code == 200:
+            j_data = j_res.json()
+            raw_bal = j_data.get("balance")
+            decimals = int(j_data.get("jetton", {}).get("decimals", 9))
+            if raw_bal is not None:
+                not_bal = float(raw_bal) / (10 ** decimals)
+
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        with state_lock:
+            if ton_bal is not None:
+                wallet_real_ton = ton_bal
+            if not_bal is not None:
+                wallet_real_not = not_bal
+            wallet_last_sync = now_str
+        return True
+    except Exception as e:
+        print("Tonkeeper sync error:", e)
+        return False
+
+
 def fetch_real_ton_price():
     global ton_price_usd, ton_change_24h, last_ton_fetch_time
+
+    try:
+        url_gt = "https://api.geckoterminal.com/api/v2/networks/ton/tokens/EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"
+        res_gt = http_session.get(url_gt, headers={"Accept": "application/json"}, timeout=8)
+        if res_gt.status_code == 200:
+            attrs = res_gt.json().get("data", {}).get("attributes", {})
+            if attrs.get("price_usd"):
+                ton_price_usd = float(attrs["price_usd"])
+                last_ton_fetch_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                return ton_price_usd
+    except Exception as e:
+        print("GeckoTerminal TON error:", e)
 
     try:
         url = "https://api.coingecko.com/api/v3/simple/price"
@@ -110,62 +183,51 @@ def fetch_real_ton_price():
             "vs_currencies": "usd",
             "include_24hr_change": "true",
         }
-        res = requests.get(url, params=params, timeout=10)
-        res.raise_for_status()
-        data = res.json().get("the-open-network")
-        if data and data.get("usd"):
-            ton_price_usd = float(data["usd"])
-            ton_change_24h = float(data.get("usd_24h_change") or 0.0)
-            last_ton_fetch_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-            return ton_price_usd
+        res = http_session.get(url, params=params, timeout=8)
+        if res.status_code == 200:
+            data = res.json().get("the-open-network")
+            if data and data.get("usd"):
+                ton_price_usd = float(data["usd"])
+                ton_change_24h = float(data.get("usd_24h_change") or 0.0)
+                last_ton_fetch_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                return ton_price_usd
     except Exception as e:
         print("CoinGecko TON error:", e)
-
-    try:
-        url_gt = "https://api.geckoterminal.com/api/v2/networks/ton/tokens/EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"
-        res_gt = requests.get(url_gt, headers={"Accept": "application/json"}, timeout=10)
-        res_gt.raise_for_status()
-        attrs = res_gt.json().get("data", {}).get("attributes", {})
-        if attrs.get("price_usd"):
-            ton_price_usd = float(attrs["price_usd"])
-            last_ton_fetch_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-            return ton_price_usd
-    except Exception as e:
-        print("GeckoTerminal TON error:", e)
 
     return None
 
 
 def fetch_real_not_usd_price():
-    # ۱. CoinGecko
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {"ids": NOT_CONFIG["coingecko_id"], "vs_currencies": "usd"}
-        res = requests.get(url, params=params, timeout=10)
-        if res.status_code == 200:
-            val = res.json().get(NOT_CONFIG["coingecko_id"], {}).get("usd")
-            if val is not None and float(val) > 0:
-                return float(val)
-    except Exception as e:
-        print("CoinGecko NOT error:", e)
+    global last_price_source
 
-    # ۲. GeckoTerminal (قرارداد NOT روی شبکه ton)
     try:
         addr = NOT_CONFIG["jetton_address"].lower()
         url_gt = f"https://api.geckoterminal.com/api/v2/networks/ton/tokens/{addr}"
-        res_gt = requests.get(url_gt, headers={"Accept": "application/json"}, timeout=10)
+        res_gt = http_session.get(url_gt, headers={"Accept": "application/json"}, timeout=8)
         if res_gt.status_code == 200:
             p_usd = res_gt.json().get("data", {}).get("attributes", {}).get("price_usd")
             if p_usd is not None and float(p_usd) > 0:
+                last_price_source = "GeckoTerminal (TON)"
                 return float(p_usd)
     except Exception as e:
         print("GeckoTerminal NOT error:", e)
+
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {"ids": NOT_CONFIG["coingecko_id"], "vs_currencies": "usd"}
+        res = http_session.get(url, params=params, timeout=8)
+        if res.status_code == 200:
+            val = res.json().get(NOT_CONFIG["coingecko_id"], {}).get("usd")
+            if val is not None and float(val) > 0:
+                last_price_source = "CoinGecko"
+                return float(val)
+    except Exception as e:
+        print("CoinGecko NOT error:", e)
 
     return None
 
 
 def update_5m_candles():
-    """دریافت قیمت واقعی NOT و ساخت/بستن کندل‌های 5 دقیقه‌ای؛ برمی‌گرداند: (has_price, candle_closed)"""
     global last_not_usd, last_not_ton, last_not_fetch_time, current_candle, candles_5m
 
     ton_usd = fetch_real_ton_price()
@@ -201,7 +263,6 @@ def update_5m_candles():
             current_candle["low"] = min(current_candle["low"], not_in_ton)
             current_candle["close"] = not_in_ton
         else:
-            # کندل 5 دقیقه‌ای قبلی بسته می‌شود و کندل جدید آغاز می‌گردد
             candles_5m.append(dict(current_candle))
             if len(candles_5m) > 120:
                 candles_5m.pop(0)
@@ -226,7 +287,6 @@ def calc_sma(closes, period):
 
 
 def analyze_not_5m():
-    """تحلیل کوتاه‌مدت روی کندل‌های بسته‌شده 5 دقیقه‌ای NOT"""
     with state_lock:
         closes = [c["close"] for c in candles_5m]
         last_c = candles_5m[-1] if candles_5m else None
@@ -248,7 +308,6 @@ def analyze_not_5m():
     score = 0
     reasons = []
 
-    # کندل 5 دقیقه‌ای سبز کوتاه و کنترل‌شده (بدون پرش بیش‌ازحد که احتمال اصلاح دارد)
     if 0.15 <= candle_body_pct <= 1.5:
         score += 1
         reasons.append(f"کندل 5m سبز ({candle_body_pct:+.2f}%)")
@@ -305,7 +364,6 @@ def process_short_term_step():
         if not trading_enabled:
             return
 
-        # ۱. مدیریت خروج سریع (حد سود کوتاه، سر‌به‌سر، تریلینگ و حد ضرر کوتاه)
         if open_position is not None:
             entry_price = open_position["entry_price_ton"]
             token_qty = open_position["token_qty"]
@@ -344,6 +402,7 @@ def process_short_term_step():
                 record = {
                     "id": open_position["id"],
                     "symbol": "NOT",
+                    "trade_type": open_position.get("trade_type", "چنج / خرید صعودی (LONG)"),
                     "entry_price": entry_price,
                     "exit_price": curr_price,
                     "profit_ton": profit_ton,
@@ -358,18 +417,18 @@ def process_short_term_step():
                     cooldown_remaining = COOLDOWN_CANDLES
 
                 msg = (
-                    f"📤 <b>خروج کوتاه معامله #{record['id']} (NOT - 5m)</b> [<code>{RUN_ID}</code>]\n"
+                    f"📤 <b>خروج کوتاه معامله #{record['id']} (NOT - 5m | فرضی)</b> [<code>{RUN_ID}</code>]\n"
+                    f"🔄 نوع معامله: <b>چنج برگشتی (NOT → TON)</b> | جهت اصلی: <b>لانگ / صعودی (LONG)</b>\n"
                     f"📥 ورود: <code>{entry_price:.8f} TON</code>\n"
                     f"📤 خروج: <code>{curr_price:.8f} TON</code>\n"
                     f"📌 علت: <b>{exit_reason}</b>\n"
                     f"💰 سود/ضرر خالص: <code>{profit_ton:+.4f} TON</code> (<code>{net_pnl_pct:+.2f}%</code>)\n"
-                    f"💼 موجودی جدید: <b>{balance_ton:.4f} TON</b>\n"
+                    f"💼 موجودی فرضی جدید: <b>{balance_ton:.4f} TON</b>\n"
                     f"🕒 زمان: <code>{now_str}</code>"
                 )
                 send_telegram_message(msg)
             return
 
-        # ۲. بررسی ورود فقط در زمان بسته شدن کندل 5 دقیقه‌ای جدید
         if not candle_closed:
             return
 
@@ -393,9 +452,11 @@ def process_short_term_step():
 
             balance_ton -= spend_ton
             trade_counter += 1
+            trade_type_label = "چنج / خرید صعودی (LONG: TON → NOT)"
             open_position = {
                 "id": trade_counter,
                 "symbol": "NOT",
+                "trade_type": trade_type_label,
                 "entry_price_ton": curr_price,
                 "token_qty": token_qty,
                 "spent_ton": spend_ton,
@@ -407,14 +468,15 @@ def process_short_term_step():
             sl_price = curr_price * (1.0 + STOP_LOSS_PCT / 100.0)
 
             msg = (
-                f"📥 <b>ورود کوتاه معامله #{trade_counter} (NOT - تایم‌فریم 5m)</b> [<code>{RUN_ID}</code>]\n"
-                f"💵 سرمایه تخصیص‌یافته: <b>{spend_ton:.4f} TON</b>\n"
+                f"📥 <b>ورود کوتاه معامله #{trade_counter} (NOT - 5m | فرضی)</b> [<code>{RUN_ID}</code>]\n"
+                f"🔄 نوع معامله: <b>چنج / خرید صعودی — LONG (TON → NOT)</b>\n"
+                f"💵 سرمایه فرضی تخصیص‌یافته: <b>{spend_ton:.4f} TON</b>\n"
                 f"🎯 قیمت ورود: <code>{curr_price:.8f} TON</code>\n"
                 f"📊 امتیاز کندل 5m: <b>{sc}</b> | تغییر کندل: <code>{step_pct:+.2f}%</code>\n"
                 f"🧠 سیگنال: <i>{reason_txt}</i>\n"
                 f"🟢 هدف سود کوتاه: <code>{tp_price:.8f} TON</code> ({TAKE_PROFIT_PCT:+.2f}%)\n"
                 f"🔴 حد ضرر کوتاه: <code>{sl_price:.8f} TON</code> ({STOP_LOSS_PCT:+.2f}%)\n"
-                f"💼 موجودی نقد باقی‌مانده: <b>{balance_ton:.4f} TON</b>\n"
+                f"💼 موجودی فرضی باقی‌مانده: <b>{balance_ton:.4f} TON</b>\n"
                 f"🕒 زمان: <code>{now_str}</code>"
             )
             send_telegram_message(msg)
@@ -431,6 +493,37 @@ def get_total_equity_ton():
     return equity
 
 
+def build_wallet_text():
+    with state_lock:
+        addr = TONKEEPER_WALLET
+        if not addr:
+            return (
+                f"👛 <b>کیف پول Tonkeeper متصل نیست</b> [<code>{RUN_ID}</code>]\n"
+                "برای اتصال آدرس عمومی کیف پول Tonkeeper:\n"
+                "<code>/wallet آدرس_کیف_پول_شما</code>"
+            )
+
+        ton_b = f"{wallet_real_ton:.4f} TON" if wallet_real_ton is not None else "در حال همگام‌سازی..."
+        not_b = f"{wallet_real_not:,.2f} NOT" if wallet_real_not is not None else "در حال همگام‌سازی..."
+        ton_p = f"${ton_price_usd:.4f}" if ton_price_usd else "نامشخص"
+        not_p_usd = f"${last_not_usd:.6f}" if last_not_usd else "نامشخص"
+        not_p_ton = f"{last_not_ton:.8f} TON" if last_not_ton else "نامشخص"
+        src_str = last_price_source or "نامشخص"
+        sync_t = wallet_last_sync or "هنوز همگام نشده"
+
+        return (
+            f"👛 <b>وضعیت کیف پول متصل Tonkeeper (نمایشی)</b> [<code>{RUN_ID}</code>]\n"
+            f"• آدرس متصل: <code>{addr}</code>\n"
+            f"• موجودی واقعی TON: <b>{ton_b}</b>\n"
+            f"• موجودی واقعی NOT: <b>{not_b}</b>\n"
+            f"• قیمت واقعی TON: <b>{ton_p}</b>\n"
+            f"• قیمت واقعی NOT: <code>{not_p_ton}</code> (<code>{not_p_usd}</code>)\n"
+            f"• منبع قیمت: <b>{src_str}</b> (هر {SAMPLE_SECONDS}s)\n"
+            f"• حالت ترید: <b>موجودی فرضی ({INITIAL_TON_BALANCE:.0f} TON)</b>\n"
+            f"• آخرین همگام‌سازی: <code>{sync_t}</code>"
+        )
+
+
 def build_status_text():
     with state_lock:
         total_pnl = sum(t["profit_ton"] for t in closed_trades)
@@ -440,24 +533,29 @@ def build_status_text():
         total_equity = get_total_equity_ton()
         total_return_pct = ((total_equity - INITIAL_TON_BALANCE) / INITIAL_TON_BALANCE) * 100.0
 
-        mode_str = "🟢 روشن (در حال ترید 5m روی NOT)" if trading_enabled else "🔴 متوقف (قطع‌شده)"
+        mode_str = "🟢 روشن (ترید فرضی 5m روی NOT)" if trading_enabled else "🔴 متوقف (قطع‌شده)"
         ton_str = f"${ton_price_usd:.4f}" if ton_price_usd else "در انتظار"
         not_str = f"{last_not_ton:.8f} TON" if last_not_ton else "در انتظار"
+        not_usd_str = f"${last_not_usd:.6f}" if last_not_usd else "—"
+        wallet_str = f"متصل (<code>{TONKEEPER_WALLET[:8]}...</code>)" if TONKEEPER_WALLET else "متصل نشده"
         c_count = len(candles_5m)
         cd_str = f"{cooldown_remaining} کندل" if cooldown_remaining > 0 else "خیر"
+        pos_str = f"بله (NOT | LONG/چنج)" if open_position else "خیر"
 
         return (
-            f"📊 <b>وضعیت ربات اسکالپر/کوتاه NOT (تایم‌فریم 5m)</b> [<code>{RUN_ID}</code>]\n"
+            f"📊 <b>وضعیت ربات تریدر NOT (5m)</b> [<code>{RUN_ID}</code>]\n"
             f"⚙️ وضعیت ترید: <b>{mode_str}</b>\n"
-            f"🪙 ارز فعال: <b>فقط NOT</b> | کندل‌های 5m بسته‌شده: <b>{c_count}</b>\n"
-            f"💎 قیمت NOT: <code>{not_str}</code>\n"
+            f"🔄 سبک معاملات: <b>چنج / خرید صعودی (LONG)</b>\n"
+            f"👛 کیف پول Tonkeeper: {wallet_str}\n"
+            f"🪙 کندل‌های 5m بسته‌شده: <b>{c_count}</b> | بازه رصد: <b>{SAMPLE_SECONDS}s</b>\n"
+            f"💎 قیمت NOT: <code>{not_str}</code> (<code>{not_usd_str}</code>)\n"
             f"💵 قیمت TON: <b>{ton_str}</b> (۲۴h: <code>{ton_change_24h:+.2f}%</code>)\n"
-            f"💼 موجودی نقد: <b>{balance_ton:.4f} TON</b>\n"
-            f"💎 ارزش کل دارایی: <b>{total_equity:.4f} TON</b> (<code>{total_return_pct:+.2f}%</code>)\n"
+            f"💼 موجودی فرضی نقد: <b>{balance_ton:.4f} TON</b>\n"
+            f"💎 ارزش کل دارایی فرضی: <b>{total_equity:.4f} TON</b> (<code>{total_return_pct:+.2f}%</code>)\n"
             f"📈 سود/ضرر خالص بسته: <code>{total_pnl:+.4f} TON</code>\n"
             f"🏆 نرخ برد: <b>{wins}/{total_closed}</b> (<code>{win_rate:.1f}%</code>)\n"
             f"⏳ استراحت پس از ضرر: <b>{cd_str}</b>\n"
-            f"🔓 پوزیشن باز: <b>{'بله (NOT)' if open_position else 'خیر'}</b>"
+            f"🔓 پوزیشن باز: <b>{pos_str}</b>"
         )
 
 
@@ -473,8 +571,8 @@ def build_stats_text():
         win_rate = (len(wins) / total_closed * 100.0) if total_closed > 0 else 0.0
 
         return (
-            f"📈 <b>آمار دقیق معاملات کوتاه NOT (5m)</b> [<code>{RUN_ID}</code>]\n"
-            f"• سرمایه اولیه: <b>{INITIAL_TON_BALANCE:.2f} TON</b>\n"
+            f"📈 <b>آمار دقیق معاملات فرضی NOT (5m | LONG/چنج)</b> [<code>{RUN_ID}</code>]\n"
+            f"• سرمایه فرضی اولیه: <b>{INITIAL_TON_BALANCE:.2f} TON</b>\n"
             f"• کل معاملات بسته‌شده: <b>{total_closed}</b>\n"
             f"• سودده: <b>{len(wins)}</b> | زیان‌ده: <b>{len(losses)}</b>\n"
             f"• نرخ برد: <b>{win_rate:.1f}%</b>\n"
@@ -492,9 +590,11 @@ def build_positions_text():
         entry_p = open_position["entry_price_ton"]
         pnl_pct = ((curr_p - entry_p) / entry_p) * 100.0
         peak_pct = open_position.get("peak_pnl_pct", pnl_pct)
+        t_type = open_position.get("trade_type", "چنج / خرید صعودی (LONG: TON → NOT)")
         return (
-            f"🔓 <b>پوزیشن باز کوتاه #{open_position['id']} (NOT)</b> [<code>{RUN_ID}</code>]\n"
-            f"• سرمایه درگیر: <b>{open_position['spent_ton']:.4f} TON</b>\n"
+            f"🔓 <b>پوزیشن باز کوتاه #{open_position['id']} (NOT | فرضی)</b> [<code>{RUN_ID}</code>]\n"
+            f"• نوع معامله: <b>{t_type}</b>\n"
+            f"• سرمایه فرضی درگیر: <b>{open_position['spent_ton']:.4f} TON</b>\n"
             f"• قیمت ورود: <code>{entry_p:.8f} TON</code>\n"
             f"• قیمت فعلی: <code>{curr_p:.8f} TON</code>\n"
             f"• سود/ضرر شناور: <code>{pnl_pct:+.2f}%</code> (اوج: <code>{peak_pct:+.2f}%</code>)"
@@ -506,10 +606,10 @@ def build_history_text():
         if not closed_trades:
             return f"📭 هنوز هیچ معامله بسته‌شده‌ای روی NOT ثبت نشده است. [<code>{RUN_ID}</code>]"
         recent = closed_trades[-6:]
-        lines = [f"📜 <b>آخرین {len(recent)} معامله کوتاه NOT (5m)</b> [<code>{RUN_ID}</code>]"]
+        lines = [f"📜 <b>آخرین {len(recent)} معامله کوتاه NOT (5m | LONG/چنج)</b> [<code>{RUN_ID}</code>]"]
         for t in reversed(recent):
             lines.append(
-                f"• #{t['id']} ورود: <code>{t['entry_price']:.8f}</code> → "
+                f"• #{t['id']} [LONG/چنج] ورود: <code>{t['entry_price']:.8f}</code> → "
                 f"خروج: <code>{t['exit_price']:.8f}</code> | "
                 f"خالص: <code>{t['profit_ton']:+.4f} TON</code> (<code>{t['pnl_pct']:+.2f}%</code>)"
             )
@@ -526,26 +626,32 @@ def reset_simulation():
         cooldown_remaining = 0
 
 
-def handle_command(cmd: str, chat_id: str):
-    global trading_enabled
+def handle_command(raw_text: str, chat_id: str):
+    global trading_enabled, TONKEEPER_WALLET
+
+    parts = raw_text.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].split("@")[0].lower()
 
     if cmd in ("/start", "/help"):
         send_telegram_message(
-            f"🤖 <b>ربات تریدر کوتاه NOT (تایم‌فریم 5m)</b> [<code>{RUN_ID}</code>]\n"
-            "• /trade_on (یا /run) — شروع ترید کوتاه روی NOT\n"
-            "• /trade_off (یا /stop) — قطع فوری ترید\n"
-            "• /status — وضعیت لحظه‌ای و تعداد کندل‌های 5m\n"
+            f"🤖 <b>ربات تریدر کوتاه NOT (5m) + Tonkeeper</b> [<code>{RUN_ID}</code>]\n"
+            "• /trade_on — شروع ترید فرضی روی NOT\n"
+            "• /trade_off — قطع فوری ترید\n"
+            "• /wallet — نمایش موجودی و قیمت‌های کیف پول متصل\n"
+            "• /status — وضعیت کلی و قیمت‌ها\n"
             "• /stats — آمار دقیق سود/ضرر و نرخ برد\n"
             "• /positions — وضعیت پوزیشن باز\n"
             "• /history — آخرین معاملات بسته\n"
-            "• /reset — ریست به 1000 TON",
+            "• /reset — ریست موجودی فرضی به 1000 TON",
             chat_id=chat_id,
         )
     elif cmd in ("/trade_on", "/run"):
         with state_lock:
             trading_enabled = True
         send_telegram_message(
-            f"🟢 <b>ترید کوتاه روی NOT (تایم‌فریم 5m) شروع شد!</b> [<code>{RUN_ID}</code>]",
+            f"🟢 <b>ترید فرضی روی NOT (5m) شروع شد!</b> [<code>{RUN_ID}</code>]",
             chat_id=chat_id,
         )
     elif cmd in ("/trade_off", "/stop"):
@@ -555,7 +661,21 @@ def handle_command(cmd: str, chat_id: str):
             f"🛑 <b>ترید روی NOT متوقف شد!</b> [<code>{RUN_ID}</code>]",
             chat_id=chat_id,
         )
+    elif cmd == "/wallet":
+        if len(parts) >= 2:
+            candidate = parts[1].strip()
+            if not is_valid_ton_address(candidate):
+                send_telegram_message(
+                    f"⚠️ آدرس کیف پول TON نامعتبر است. [<code>{RUN_ID}</code>]",
+                    chat_id=chat_id,
+                )
+                return
+            with state_lock:
+                TONKEEPER_WALLET = candidate
+        sync_tonkeeper_wallet()
+        send_telegram_message(build_wallet_text(), chat_id=chat_id)
     elif cmd == "/status":
+        sync_tonkeeper_wallet()
         send_telegram_message(build_status_text(), chat_id=chat_id)
     elif cmd == "/stats":
         send_telegram_message(build_stats_text(), chat_id=chat_id)
@@ -566,7 +686,7 @@ def handle_command(cmd: str, chat_id: str):
     elif cmd == "/reset":
         reset_simulation()
         send_telegram_message(
-            f"🔄 ریست انجام شد. موجودی جدید: <b>{INITIAL_TON_BALANCE:.2f} TON</b> [<code>{RUN_ID}</code>]",
+            f"🔄 موجودی فرضی ریست شد: <b>{INITIAL_TON_BALANCE:.2f} TON</b> [<code>{RUN_ID}</code>]",
             chat_id=chat_id,
         )
 
@@ -593,8 +713,7 @@ def poll_telegram_updates():
                         continue
                     if chat_id != TELEGRAM_CHAT_ID:
                         continue
-                    cmd = text.split()[0].split("@")[0].lower()
-                    handle_command(cmd, chat_id)
+                    handle_command(text, chat_id)
             else:
                 print("getUpdates status:", res.status_code, res.text[:200])
                 time.sleep(3)
@@ -612,10 +731,11 @@ def ensure_polling_alive():
 
 
 def trading_loop():
+    sync_tonkeeper_wallet()
     send_telegram_message(
-        f"🚀 <b>ربات تریدر کوتاه NOT (تایم‌فریم 5m) آماده شد!</b> [<code>{RUN_ID}</code>]\n"
-        f"ارز: <b>فقط NOT</b> | تایم‌فریم کندل: <b>5 دقیقه</b>\n"
-        f"حد سود کوتاه: <code>{TAKE_PROFIT_PCT:+.2f}%</code> | حد ضرر: <code>{STOP_LOSS_PCT:+.2f}%</code> | سر‌به‌سر: <code>+{BREAKEVEN_TRIGGER_PCT:.2f}%</code>\n"
+        f"🚀 <b>ربات تریدر کوتاه NOT (5m) + Tonkeeper آماده شد!</b> [<code>{RUN_ID}</code>]\n"
+        f"• کیف پول متصل: <code>{TONKEEPER_WALLET[:8]}...{TONKEEPER_WALLET[-6:]}</code>\n"
+        f"• سبک معاملات: <b>چنج / خرید صعودی (LONG)</b> | حالت: <b>فرضی ({INITIAL_TON_BALANCE:.0f} TON)</b>\n"
         f"• شروع ترید: <code>/trade_on</code> | قطع فوری: <code>/trade_off</code>"
     )
 
@@ -624,7 +744,7 @@ def trading_loop():
         try:
             process_short_term_step()
         except Exception as e:
-            print("Short-term trading step error:", e)
+            print("Trading step error:", e)
 
         time.sleep(SAMPLE_SECONDS)
 
@@ -632,4 +752,4 @@ def trading_loop():
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
     ensure_polling_alive()
-    trading_loop
+    trading_loop()
