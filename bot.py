@@ -183,24 +183,32 @@ def _extract_price_from_obj(obj):
 
 
 def fetch_irt_prices_map():
-    """دریافت قیمت لحظه‌ای دقیق تومانی از تبدیل و ثبت علت دقیق در صورت عدم دریافت"""
+    """دریافت قیمت لحظه‌ای دقیق تومانی از مسیرهای معتبر API تبدیل یا SDK رسمی"""
     global last_price_diag
     prices = {}
     diag_notes = []
 
     if spot_client is not None:
         try:
-            for attr_name in ("get_ticker_price", "ticker_price", "get_ticker"):
+            for attr_name in ("get_ticker_price", "ticker_price", "get_ticker", "get_order_book"):
                 if hasattr(spot_client, attr_name):
                     fn = getattr(spot_client, attr_name)
-                    for sym in IRT_SYMBOLS:
-                        if sym in prices:
-                            continue
+                    for sym in IRT_SYMBOLS[:5]:
                         try:
                             data = fn(symbol=sym)
-                            p, raw_s = _extract_price_from_obj(data if isinstance(data, dict) else {})
-                            if p is not None:
-                                prices[sym] = (p, raw_s)
+                            if isinstance(data, dict):
+                                p, raw_s = _extract_price_from_obj(data)
+                                if p is not None:
+                                    prices[sym] = (p, raw_s)
+                                    continue
+                                bids = data.get("bids") or []
+                                asks = data.get("asks") or []
+                                if bids and asks:
+                                    b_p = float(bids[0][0])
+                                    a_p = float(asks[0][0])
+                                    if b_p > 0 and a_p > 0:
+                                        mid_p = (b_p + a_p) / 2.0
+                                        prices[sym] = (mid_p, str(mid_p))
                         except Exception as e:
                             diag_notes.append(f"SDK {attr_name}: {type(e).__name__}")
                             break
@@ -215,28 +223,38 @@ def fetch_irt_prices_map():
         wanted_no_us = {s.replace("_", "") for s in missing}
         rev_map = {s.replace("_", ""): s for s in missing}
 
-        bulk_urls = [
-            "https://api.tabdeal.org/r/api/v1/ticker/24hr",
-            "https://api1.tabdeal.org/r/api/v1/ticker/24hr",
-            "https://api1.tabdeal.org/api/v1/ticker/24hr",
+        bases = [
+            "https://api.tabdeal.org/r/api/v1",
+            "https://api1.tabdeal.org/r/api/v1",
+            "https://api1.tabdeal.org/api/v1",
         ]
-        for url in bulk_urls:
-            try:
-                res = http_session.get(url, timeout=8)
-                if res.status_code == 200:
-                    payload = res.json()
-                    items = payload if isinstance(payload, list) else payload.get("data", payload)
-                    if isinstance(items, dict):
-                        items = [
-                            dict(v, symbol=k) if isinstance(v, dict) else {"symbol": k, "price": v}
-                            for k, v in items.items()
-                        ]
-                    if isinstance(items, list):
+        bulk_paths = ["/ticker/price", "/exchangeInfo", "/markets"]
+
+        found_bulk = False
+        for base in bases:
+            for path in bulk_paths:
+                url = f"{base}{path}"
+                try:
+                    res = http_session.get(url, timeout=8)
+                    if res.status_code == 200:
+                        payload = res.json()
+                        items = []
+                        if isinstance(payload, list):
+                            items = payload
+                        elif isinstance(payload, dict):
+                            for k in ("data", "tickers", "symbols", "markets", "result"):
+                                if isinstance(payload.get(k), list):
+                                    items = payload[k]
+                                    break
                         for row in items:
                             if not isinstance(row, dict):
                                 continue
                             raw_sym = str(
-                                row.get("symbol") or row.get("pair") or row.get("market") or ""
+                                row.get("symbol")
+                                or row.get("pair")
+                                or row.get("market")
+                                or row.get("tabdealSymbol")
+                                or ""
                             ).upper()
                             target_sym = None
                             if raw_sym in wanted_with_us:
@@ -247,38 +265,56 @@ def fetch_irt_prices_map():
                                 p, raw_s = _extract_price_from_obj(row)
                                 if p is not None:
                                     prices[target_sym] = (p, raw_s)
-                    if prices:
-                        break
-                else:
-                    diag_notes.append(f"{url} -> HTTP {res.status_code}")
-            except Exception as e:
-                diag_notes.append(f"{url} -> {type(e).__name__}: {str(e)[:60]}")
-
-        still_missing = [s for s in IRT_SYMBOLS if s not in prices]
-        if still_missing and not prices:
-            for base in ("https://api.tabdeal.org/r/api/v1", "https://api1.tabdeal.org/r/api/v1"):
-                try:
-                    r_ob = http_session.get(f"{base}/depth", params={"symbol": "BTC_IRT", "limit": 3}, timeout=6)
-                    if r_ob.status_code == 200:
-                        for sym in still_missing:
-                            try:
-                                r_s = http_session.get(f"{base}/depth", params={"symbol": sym, "limit": 3}, timeout=5)
-                                if r_s.status_code == 200:
-                                    ob = r_s.json()
-                                    bids = ob.get("bids") or []
-                                    asks = ob.get("asks") or []
-                                    if bids and asks:
-                                        b_p = float(bids[0][0])
-                                        a_p = float(asks[0][0])
-                                        if b_p > 0 and a_p > 0:
-                                            mid_p = (b_p + a_p) / 2.0
-                                            prices[sym] = (mid_p, str(mid_p))
-                            except Exception:
-                                continue
                         if prices:
+                            found_bulk = True
                             break
                 except Exception as e:
-                    diag_notes.append(f"{base}/depth -> {type(e).__name__}")
+                    diag_notes.append(f"{path} -> {type(e).__name__}")
+            if found_bulk:
+                break
+
+        # دریافت قیمت هر نماد از دفتر سفارش (/depth) یا معاملات اخیر (/trades) اگر bulk قیمتی نداد
+        still_missing = [s for s in IRT_SYMBOLS if s not in prices]
+        if still_missing:
+            working_base = None
+            for base in bases:
+                for test_path, params in (("/depth", {"symbol": "BTC_IRT", "limit": 5}), ("/trades", {"symbol": "BTC_IRT", "limit": 5})):
+                    try:
+                        r_t = http_session.get(f"{base}{test_path}", params=params, timeout=6)
+                        if r_t.status_code == 200:
+                            working_base = (base, test_path)
+                            break
+                    except Exception:
+                        continue
+                if working_base:
+                    break
+
+            if working_base:
+                w_base, w_path = working_base
+                for sym in still_missing:
+                    try:
+                        r_s = http_session.get(f"{w_base}{w_path}", params={"symbol": sym, "limit": 5}, timeout=5)
+                        if r_s.status_code == 200:
+                            data = r_s.json()
+                            if w_path == "/depth" and isinstance(data, dict):
+                                bids = data.get("bids") or []
+                                asks = data.get("asks") or []
+                                if bids and asks:
+                                    b_p = float(bids[0][0])
+                                    a_p = float(asks[0][0])
+                                    if b_p > 0 and a_p > 0:
+                                        mid_p = (b_p + a_p) / 2.0
+                                        prices[sym] = (mid_p, str(mid_p))
+                            elif w_path == "/trades":
+                                t_list = data if isinstance(data, list) else data.get("data", [])
+                                if isinstance(t_list, list) and t_list:
+                                    p, raw_s = _extract_price_from_obj(t_list[0])
+                                    if p is not None:
+                                        prices[sym] = (p, raw_s)
+                    except Exception:
+                        continue
+            else:
+                diag_notes.append("هیچ endpoint عمومی قیمت/دفتر سفارش در تبدیل پاسخ 200 نداد")
 
     if prices:
         last_price_diag = f"دریافت موفق {len(prices)}/{len(IRT_SYMBOLS)} بازار"
