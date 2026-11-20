@@ -24,7 +24,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 TABDEAL_API_KEY = os.environ.get("TABDEAL_API_KEY", "").strip()
 TABDEAL_API_SECRET = os.environ.get("TABDEAL_API_SECRET", "").strip()
 
-# برای امنیت: تا زمانی که خودت فعال نکردی سفارش واقعی ارسال نمی‌شود
+# برای حفظ امنیت: تا زمانی که خودت فعال نکردی سفارش واقعی ارسال نمی‌شود
 LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").strip().lower() == "true"
 
 # تایم‌فریم 5 دقیقه‌ای (300s) با نمونه‌برداری هر 20s
@@ -44,6 +44,7 @@ COOLDOWN_CANDLES = int(os.environ.get("COOLDOWN_CANDLES", "2"))
 
 RUN_ID = str(uuid.uuid4())[:8]
 
+# جفت‌ارزهای تومانی فعال برای پایش و ترید کوتاه 5 دقیقه‌ای
 IRT_SYMBOLS = [
     "BTC_IRT",
     "ETH_IRT",
@@ -52,6 +53,14 @@ IRT_SYMBOLS = [
     "DOGS_IRT",
     "SOL_IRT",
     "TRX_IRT",
+    "ADA_IRT",
+    "PEPE_IRT",
+    "SHIB_IRT",
+    "DOGE_IRT",
+    "TURBO_IRT",
+    "BONK_IRT",
+    "ENA_IRT",
+    "ASTR_IRT",
 ]
 
 market_state = {
@@ -358,7 +367,7 @@ def process_trading_step():
                 send_telegram_message(
                     f"📤 <b>خروج (چنج/فروش — SELL) #{rec['id']} | {sym}</b> [<code>{RUN_ID}</code>]\n"
                     f"• نوع معامله: <b>{rec['trade_type']}</b>\n"
-                    f"• ورود: <code>{entry_p:,.0f} IRT</code> → خروج: <code>{curr_price:,.0f} IRT</code>\n"
+                    f"• ورود: <code>{entry_p:,.2f} IRT</code> → خروج: <code>{curr_price:,.2f} IRT</code>\n"
                     f"• علت: <b>{exit_reason}</b>\n"
                     f"• سود/ضرر خالص: <code>{profit_irt:+,.0f} IRT</code> (<code>{net_pnl_pct:+.2f}%</code>)\n"
                     f"• موجودی فرضی جدید: <b>{balance_irt:,.0f} IRT</b>"
@@ -429,11 +438,11 @@ def process_trading_step():
             f"📥 <b>ورود کوتاه #{trade_counter} | {best_sym} (5m)</b> [<code>{RUN_ID}</code>]\n"
             f"• نوع معامله: <b>{trade_type_label}</b>\n"
             f"• سرمایه فرضی تخصیص‌یافته: <b>{spend_irt:,.0f} IRT</b>\n"
-            f"• مقدار خرید: <code>{qty}</code> | قیمت ورود: <code>{curr_p:,.0f} IRT</code>\n"
+            f"• مقدار خرید: <code>{qty}</code> | قیمت ورود: <code>{curr_p:,.2f} IRT</code>\n"
             f"• امتیاز کندل 5m: <b>{best_score}</b> | بدنه کندل: <code>{best_body:+.2f}%</code>\n"
             f"• سیگنال: <i>{best_reason}</i>\n"
-            f"• هدف سود کوتاه: <code>{tp_p:,.0f} IRT</code> ({TAKE_PROFIT_PCT:+.2f}%) | "
-            f"حد ضرر: <code>{sl_p:,.0f} IRT</code> ({STOP_LOSS_PCT:+.2f}%)\n"
+            f"• هدف سود کوتاه: <code>{tp_p:,.2f} IRT</code> ({TAKE_PROFIT_PCT:+.2f}%) | "
+            f"حد ضرر: <code>{sl_p:,.2f} IRT</code> ({STOP_LOSS_PCT:+.2f}%)\n"
             f"• موجودی فرضی باقی‌مانده: <b>{balance_irt:,.0f} IRT</b>"
         )
 
@@ -451,10 +460,13 @@ def build_status_text():
         pos_s = f"بله ({open_position['symbol']} | LONG/چنج)" if open_position else "خیر"
         cd_s = f"{cooldown_remaining} کندل" if cooldown_remaining > 0 else "خیر"
 
+        active_priced = sum(1 for s in IRT_SYMBOLS if market_state[s]["last_price"] is not None)
+        max_candles = max((len(market_state[s]["candles_5m"]) for s in IRT_SYMBOLS), default=0)
+
         return (
             f"📊 <b>وضعیت ربات تریدر تبدیل (تومانی | 5m)</b> [<code>{RUN_ID}</code>]\n"
             f"• وضعیت ترید: <b>{mode_s}</b> | حالت سفارش: <b>{live_s}</b>\n"
-            f"• جفت‌ارزهای تومانی تحت نظر: <b>{len(IRT_SYMBOLS)} بازار IRT</b>\n"
+            f"• بازارهای IRT: <b>{active_priced}/{len(IRT_SYMBOLS)} دارای قیمت</b> | کندل‌های 5m: <b>{max_candles}</b>\n"
             f"• موجودی فرضی نقد: <b>{balance_irt:,.0f} IRT</b>\n"
             f"• ارزش کل دارایی فرضی: <b>{eq:,.0f} IRT</b> (<code>{ret_pct:+.2f}%</code>)\n"
             f"• سود/ضرر خالص بسته: <code>{total_pnl:+,.0f} IRT</code>\n"
@@ -493,7 +505,7 @@ def build_positions_text():
             f"🔓 <b>پوزیشن باز #{open_position['id']} | {sym}</b> [<code>{RUN_ID}</code>]\n"
             f"• نوع معامله: <b>{open_position.get('trade_type', 'چنج / خرید صعودی (LONG)')}</b>\n"
             f"• سرمایه فرضی درگیر: <b>{open_position['spent_irt']:,.0f} IRT</b>\n"
-            f"• قیمت ورود: <code>{entry_p:,.0f} IRT</code> | فعلی: <code>{curr_p:,.0f} IRT</code>\n"
+            f"• قیمت ورود: <code>{entry_p:,.2f} IRT</code> | فعلی: <code>{curr_p:,.2f} IRT</code>\n"
             f"• سود/ضرر شناور: <code>{pnl_pct:+.2f}%</code>"
         )
 
@@ -531,7 +543,7 @@ def handle_command(raw_text: str, chat_id: str):
             f"🤖 <b>ربات تریدر کوتاه تبدیل (تومانی | 5m)</b> [<code>{RUN_ID}</code>]\n"
             "• /trade_on — شروع ترید کوتاه تومانی\n"
             "• /trade_off — قطع فوری ترید\n"
-            "• /status — وضعیت کلی و موجودی فرضی\n"
+            "• /status — وضعیت کلی، قیمت‌ها و کندل‌ها\n"
             "• /stats — آمار دقیق سود/ضرر و نرخ برد\n"
             "• /positions — پوزیشن باز فعلی\n"
             "• /history — آخرین معاملات بسته\n"
@@ -594,9 +606,8 @@ def ensure_polling_alive():
 def main_loop():
     send_telegram_message(
         f"🚀 <b>ربات تریدر کوتاه تبدیل (تومانی | 5m) آماده شد!</b> [<code>{RUN_ID}</code>]\n"
-        f"• سرمایه فرضی: <b>{INITIAL_IRT_BALANCE:,.0f} IRT</b> (10 میلیون تومان)\n"
-        f"• تایم‌فریم: <b>5 دقیقه‌ای</b> | هدف سود کوتاه: <code>{TAKE_PROFIT_PCT:+.2f}%</code> | حد ضرر: <code>{STOP_LOSS_PCT:+.2f}%</code>\n"
-        f"• حالت سفارش: <b>{'واقعی (تبدیل)' if LIVE_TRADING else 'تست ایمن (LIVE_TRADING=False)'}</b>\n"
+        f"• تعداد بازارهای IRT تحت نظر: <b>{len(IRT_SYMBOLS)} ارز</b>\n"
+        f"• سرمایه فرضی: <b>{INITIAL_IRT_BALANCE:,.0f} IRT</b> | تایم‌فریم: <b>5 دقیقه‌ای</b>\n"
         f"• شروع ترید: <code>/trade_on</code> | قطع فوری: <code>/trade_off</code>"
     )
     while True:
