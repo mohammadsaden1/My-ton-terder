@@ -82,8 +82,10 @@ spot_client = (
     else None
 )
 http_session = requests.Session()
+http_session.headers.update({"User-Agent": "Mozilla/5.0 TabdealTraderBot/1.0"})
 
 last_update_id = 0
+last_price_diag = "هنوز بررسی نشده"
 trade_counter = 0
 cooldown_remaining = 0
 consecutive_losses = 0
@@ -181,8 +183,10 @@ def _extract_price_from_obj(obj):
 
 
 def fetch_irt_prices_map():
-    """دریافت قیمت لحظه‌ای دقیق تومانی از SDK رسمی تبدیل یا APIهای تبدیل"""
+    """دریافت قیمت لحظه‌ای دقیق تومانی از تبدیل و ثبت علت دقیق در صورت عدم دریافت"""
+    global last_price_diag
     prices = {}
+    diag_notes = []
 
     if spot_client is not None:
         try:
@@ -197,12 +201,13 @@ def fetch_irt_prices_map():
                             p, raw_s = _extract_price_from_obj(data if isinstance(data, dict) else {})
                             if p is not None:
                                 prices[sym] = (p, raw_s)
-                        except Exception:
-                            continue
+                        except Exception as e:
+                            diag_notes.append(f"SDK {attr_name}: {type(e).__name__}")
+                            break
                     if prices:
                         break
         except Exception as e:
-            print("Tabdeal SDK price warning:", repr(e))
+            diag_notes.append(f"SDK err: {type(e).__name__}")
 
     missing = [s for s in IRT_SYMBOLS if s not in prices]
     if missing:
@@ -210,11 +215,10 @@ def fetch_irt_prices_map():
         wanted_no_us = {s.replace("_", "") for s in missing}
         rev_map = {s.replace("_", ""): s for s in missing}
 
-        # ۱. تلاش برای دریافت تیکر یا دفتر سفارش/قیمت از API عمومی تبدیل
         bulk_urls = [
             "https://api.tabdeal.org/r/api/v1/ticker/24hr",
             "https://api1.tabdeal.org/r/api/v1/ticker/24hr",
-            "https://api.tabdeal.org/r/api/v1/market/ticker",
+            "https://api1.tabdeal.org/api/v1/ticker/24hr",
         ]
         for url in bulk_urls:
             try:
@@ -223,12 +227,17 @@ def fetch_irt_prices_map():
                     payload = res.json()
                     items = payload if isinstance(payload, list) else payload.get("data", payload)
                     if isinstance(items, dict):
-                        items = [dict(v, symbol=k) if isinstance(v, dict) else {"symbol": k, "price": v} for k, v in items.items()]
+                        items = [
+                            dict(v, symbol=k) if isinstance(v, dict) else {"symbol": k, "price": v}
+                            for k, v in items.items()
+                        ]
                     if isinstance(items, list):
                         for row in items:
                             if not isinstance(row, dict):
                                 continue
-                            raw_sym = str(row.get("symbol") or row.get("pair") or row.get("market") or "").upper()
+                            raw_sym = str(
+                                row.get("symbol") or row.get("pair") or row.get("market") or ""
+                            ).upper()
                             target_sym = None
                             if raw_sym in wanted_with_us:
                                 target_sym = raw_sym
@@ -240,29 +249,42 @@ def fetch_irt_prices_map():
                                     prices[target_sym] = (p, raw_s)
                     if prices:
                         break
+                else:
+                    diag_notes.append(f"{url} -> HTTP {res.status_code}")
             except Exception as e:
-                print(f"Tabdeal bulk endpoint {url} error:", repr(e))
+                diag_notes.append(f"{url} -> {type(e).__name__}: {str(e)[:60]}")
 
-        # ۲. در صورت نبودِ endpoint کلی 24hr، دریافت قیمت هر نماد از depth/orderbook تبدیل
         still_missing = [s for s in IRT_SYMBOLS if s not in prices]
-        if still_missing:
-            for sym in still_missing:
-                for base in ("https://api.tabdeal.org/r/api/v1", "https://api1.tabdeal.org/r/api/v1"):
-                    try:
-                        r_ob = http_session.get(f"{base}/depth", params={"symbol": sym, "limit": 5}, timeout=6)
-                        if r_ob.status_code == 200:
-                            ob = r_ob.json()
-                            bids = ob.get("bids") or []
-                            asks = ob.get("asks") or []
-                            if bids and asks:
-                                b_p = float(bids[0][0])
-                                a_p = float(asks[0][0])
-                                if b_p > 0 and a_p > 0:
-                                    mid_p = (b_p + a_p) / 2.0
-                                    prices[sym] = (mid_p, str(mid_p))
-                                    break
-                    except Exception:
-                        continue
+        if still_missing and not prices:
+            for base in ("https://api.tabdeal.org/r/api/v1", "https://api1.tabdeal.org/r/api/v1"):
+                try:
+                    r_ob = http_session.get(f"{base}/depth", params={"symbol": "BTC_IRT", "limit": 3}, timeout=6)
+                    if r_ob.status_code == 200:
+                        for sym in still_missing:
+                            try:
+                                r_s = http_session.get(f"{base}/depth", params={"symbol": sym, "limit": 3}, timeout=5)
+                                if r_s.status_code == 200:
+                                    ob = r_s.json()
+                                    bids = ob.get("bids") or []
+                                    asks = ob.get("asks") or []
+                                    if bids and asks:
+                                        b_p = float(bids[0][0])
+                                        a_p = float(asks[0][0])
+                                        if b_p > 0 and a_p > 0:
+                                            mid_p = (b_p + a_p) / 2.0
+                                            prices[sym] = (mid_p, str(mid_p))
+                            except Exception:
+                                continue
+                        if prices:
+                            break
+                except Exception as e:
+                    diag_notes.append(f"{base}/depth -> {type(e).__name__}")
+
+    if prices:
+        last_price_diag = f"دریافت موفق {len(prices)}/{len(IRT_SYMBOLS)} بازار"
+    else:
+        last_price_diag = " | ".join(diag_notes[:3]) if diag_notes else "هیچ قیمتی از تبدیل برنگشت"
+        print("Tabdeal price fetch failed:", last_price_diag)
 
     return prices
 
@@ -789,6 +811,8 @@ def build_prices_text():
         lines = [
             f"💰 <b>قیمت دقیق لحظه‌ای ارزها در تبدیل ({len(priced)}/{len(IRT_SYMBOLS)} بازار)</b> [<code>{RUN_ID}</code>]"
         ]
+        if not priced:
+            lines.append(f"⚠️ <i>علت عدم دریافت:</i> <code>{last_price_diag}</code>")
         for sym in IRT_SYMBOLS:
             st = market_state[sym]
             p = st["last_price"]
