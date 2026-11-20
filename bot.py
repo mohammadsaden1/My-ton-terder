@@ -2,9 +2,13 @@ import os
 import time
 import uuid
 import threading
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
+
+try:
+    from tabdeal.spot import Spot
+except Exception:
+    Spot = None
 
 DEFAULT_TOKEN = "9080285155:AAHuZFiALLtk9Sstk1jTFFZN0PwPLWFhgWM"
 DEFAULT_CHAT_ID = "1951133060"
@@ -13,22 +17,25 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", DEFAULT_TOKEN).strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", DEFAULT_CHAT_ID).strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
-# بازه پایش و تایم‌فریم کوتاه
-SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "10"))
+TABDEAL_API_KEY = os.environ.get("TABDEAL_API_KEY", "").strip()
+TABDEAL_API_SECRET = os.environ.get("TABDEAL_API_SECRET", "").strip()
+TABDEAL_PROXY_URL = os.environ.get("TABDEAL_PROXY_URL", "").strip()
+
+SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "12"))
 FAST_TF_SECONDS = int(os.environ.get("FAST_TF_SECONDS", "30"))
 TREND_TF_SECONDS = int(os.environ.get("TREND_TF_SECONDS", "180"))
 
-# کارمزد هر سمت در تبدیل (مثلاً 0.002 یعنی 0.2% => رفت‌وبرگشت 0.4%)
+# کارمزد هر سمت (0.2% => رفت‌وبرگشت 0.4%)
 FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))
 ROUND_TRIP_FEE_PCT = FEE_RATE * 200.0
 
-# سود کم و منطقی: حداقل کارمزد رفت‌وبرگشت + حاشیه سود خالص واقعی
+# سود کم و منطقی: تارگت ناخالص 0.85% => سود خالص پس از 0.40% کارمزد حدود +0.45%
 MIN_GROSS_TARGET_PCT = ROUND_TRIP_FEE_PCT + 0.45
 GROSS_TARGET_PCT = max(float(os.environ.get("GROSS_TARGET_PCT", "0.85")), MIN_GROSS_TARGET_PCT)
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-0.55"))
 
-MIN_SIGNAL_SCORE = int(os.environ.get("MIN_SIGNAL_SCORE", "2"))
-PER_SYMBOL_COOLDOWN_SEC = int(os.environ.get("PER_SYMBOL_COOLDOWN_SEC", "120"))
+MIN_SIGNAL_SCORE = int(os.environ.get("MIN_SIGNAL_SCORE", "1"))
+PER_SYMBOL_COOLDOWN_SEC = int(os.environ.get("PER_SYMBOL_COOLDOWN_SEC", "90"))
 
 RUN_ID = str(uuid.uuid4())[:8]
 
@@ -43,23 +50,26 @@ SEED_IRT_SYMBOLS = [
 ]
 
 API_BASES = [
-    "https://api.tabdeal.org",
     "https://api1.tabdeal.org",
-    "https://api2.tabdeal.org",
-]
-
-API_PREFIXES = [
-    "/r/api/v1",
-    "/api/v1",
-    "/spot/api/v1",
-    "/v1",
+    "https://api.tabdeal.org",
 ]
 
 http_session = requests.Session()
 http_session.headers.update({
-    "User-Agent": "Mozilla/5.0 TabdealPrecisionSignalBot/2.0",
+    "User-Agent": "Mozilla/5.0 TabdealSignalBot/3.0",
     "Accept": "application/json",
 })
+if TABDEAL_PROXY_URL:
+    http_session.proxies.update({
+        "http": TABDEAL_PROXY_URL,
+        "https": TABDEAL_PROXY_URL,
+    })
+
+spot_client = (
+    Spot(TABDEAL_API_KEY, TABDEAL_API_SECRET)
+    if (Spot is not None and TABDEAL_API_KEY and TABDEAL_API_SECRET)
+    else None
+)
 
 active_symbols = list(SEED_IRT_SYMBOLS)
 market_state = {}
@@ -77,7 +87,6 @@ def ensure_symbol_state(sym: str):
         market_state[sym] = {
             "price": None,
             "price_raw": None,
-            "updated_at": None,
             "fast_candles": [],
             "fast_cur": None,
             "trend_candles": [],
@@ -90,7 +99,6 @@ for _s in SEED_IRT_SYMBOLS:
 
 
 def format_price_irt(value: float, raw_str: str = None) -> str:
-    """نمایش دقیق قیمت تومانی با حفظ ارقام اعشاری واقعی دریافت‌شده از صرافی"""
     if raw_str is not None and str(raw_str).strip() != "":
         s = str(raw_str).strip().replace(",", "")
         try:
@@ -157,8 +165,7 @@ def _normalize_irt_symbol(raw_sym: str):
     if s.endswith("_IRT") and len(s) > 4:
         return s
     if s.endswith("IRT") and len(s) > 3 and "_" not in s:
-        base = s[:-3]
-        return f"{base}_IRT"
+        return f"{s[:-3]}_IRT"
     return None
 
 
@@ -200,71 +207,78 @@ def _extract_rows(payload):
 
 
 def fetch_all_irt_prices_from_tabdeal():
-    """دریافت قیمت لحظه‌ای دقیق همه بازارهای تومانی مستقیماً از تبدیل"""
+    """دریافت قیمت لحظه‌ای دقیق از تبدیل از طریق SDK یا مسیرهای REST مستند"""
     global last_fetch_info, last_fetch_ok, active_symbols
 
     prices = {}
     discovered = set(SEED_IRT_SYMBOLS)
-    errors = []
+    diag_errors = []
 
-    bulk_endpoints = ["/ticker/price", "/ticker/24hr", "/ticker", "/exchangeInfo", "/markets", "/symbols"]
-
-    for base in API_BASES:
-        for prefix in API_PREFIXES:
-            for ep in bulk_endpoints:
-                url = f"{base}{prefix}{ep}"
+    if spot_client is not None:
+        for method_name in ("exchange_info", "get_exchange_info", "ticker_24hr", "get_ticker"):
+            if hasattr(spot_client, method_name):
                 try:
-                    resp = http_session.get(url, timeout=8)
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
-                    rows = _extract_rows(data)
+                    res = getattr(spot_client, method_name)()
+                    rows = _extract_rows(res)
                     for row in rows:
                         if not isinstance(row, dict):
                             continue
-                        raw_sym = (
-                            row.get("symbol")
-                            or row.get("pair")
-                            or row.get("market")
-                            or row.get("tabdealSymbol")
-                            or row.get("name")
-                        )
+                        raw_sym = row.get("symbol") or row.get("pair") or row.get("market")
                         norm_sym = _normalize_irt_symbol(raw_sym)
-                        if not norm_sym:
-                            continue
-                        discovered.add(norm_sym)
-                        p, raw_s = _extract_price(row)
-                        if p is not None and norm_sym not in prices:
-                            prices[norm_sym] = (p, raw_s)
+                        if norm_sym:
+                            discovered.add(norm_sym)
+                            p, raw_s = _extract_price(row)
+                            if p is not None and norm_sym not in prices:
+                                prices[norm_sym] = (p, raw_s)
                     if prices:
-                        with state_lock:
-                            active_symbols = sorted(discovered)
-                            for s in active_symbols:
-                                ensure_symbol_state(s)
-                        last_fetch_ok = True
-                        last_fetch_info = f"متصل به {base}{prefix}{ep} ({len(prices)} بازار IRT)"
-                        return prices
+                        break
                 except Exception as e:
-                    errors.append(f"{url}: {type(e).__name__}")
+                    diag_errors.append(f"SDK.{method_name}: {type(e).__name__}")
 
-    # اگر endpoint کلی قیمتی نداد، از دفتر سفارش (/depth) یا معاملات اخیر (/trades) برای هر نماد قیمت می‌گیریم
-    for base in API_BASES:
-        for prefix in API_PREFIXES:
-            for ep, mode in (("/depth", "depth"), ("/trades", "trades")):
-                probe_url = f"{base}{prefix}{ep}"
+    if not prices:
+        for base in API_BASES:
+            for ep in ("/r/api/v1/exchangeInfo", "/api/v1/exchangeInfo", "/r/api/v1/ticker/24hr"):
+                url = f"{base}{ep}"
                 try:
-                    probe = http_session.get(probe_url, params={"symbol": "BTC_IRT", "limit": 5}, timeout=6)
+                    resp = http_session.get(url, timeout=8)
+                    if resp.status_code != 200:
+                        diag_errors.append(f"{ep}->{resp.status_code}")
+                        continue
+                    rows = _extract_rows(resp.json())
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        raw_sym = row.get("symbol") or row.get("pair") or row.get("market") or row.get("name")
+                        norm_sym = _normalize_irt_symbol(raw_sym)
+                        if norm_sym:
+                            discovered.add(norm_sym)
+                            p, raw_s = _extract_price(row)
+                            if p is not None and norm_sym not in prices:
+                                prices[norm_sym] = (p, raw_s)
+                    if prices:
+                        break
+                except Exception as e:
+                    diag_errors.append(f"{base}:{type(e).__name__}")
+            if prices:
+                break
+
+    if not prices:
+        with state_lock:
+            syms_to_check = list(active_symbols)
+        for base in API_BASES:
+            for ep in ("/r/api/v1/depth", "/r/api/v1/trades"):
+                url = f"{base}{ep}"
+                try:
+                    probe = http_session.get(url, params={"symbol": "BTC_IRT", "limit": 5}, timeout=6)
                     if probe.status_code != 200:
                         continue
-                    with state_lock:
-                        syms_to_check = list(active_symbols)
                     for sym in syms_to_check:
                         try:
-                            r = http_session.get(probe_url, params={"symbol": sym, "limit": 5}, timeout=5)
+                            r = http_session.get(url, params={"symbol": sym, "limit": 5}, timeout=5)
                             if r.status_code != 200:
                                 continue
                             payload = r.json()
-                            if mode == "depth" and isinstance(payload, dict):
+                            if ep.endswith("/depth") and isinstance(payload, dict):
                                 bids = payload.get("bids") or []
                                 asks = payload.get("asks") or []
                                 if bids and asks:
@@ -273,7 +287,7 @@ def fetch_all_irt_prices_from_tabdeal():
                                     if b_p > 0 and a_p > 0:
                                         mid_p = (b_p + a_p) / 2.0
                                         prices[sym] = (mid_p, str(mid_p))
-                            elif mode == "trades":
+                            elif ep.endswith("/trades"):
                                 t_list = _extract_rows(payload)
                                 if t_list and isinstance(t_list[0], dict):
                                     p, raw_s = _extract_price(t_list[0])
@@ -282,32 +296,39 @@ def fetch_all_irt_prices_from_tabdeal():
                         except Exception:
                             continue
                     if prices:
-                        last_fetch_ok = True
-                        last_fetch_info = f"متصل به {base}{prefix}{ep} ({len(prices)}/{len(syms_to_check)} بازار IRT)"
-                        return prices
+                        break
                 except Exception:
                     continue
+            if prices:
+                break
+
+    if prices:
+        with state_lock:
+            active_symbols = sorted(discovered)
+            for s in active_symbols:
+                ensure_symbol_state(s)
+        last_fetch_ok = True
+        last_fetch_info = f"متصل به تبدیل ({len(prices)} بازار IRT)"
+        return prices
 
     last_fetch_ok = False
-    last_fetch_info = "عدم دریافت قیمت از API تبدیل" + (f" ({errors[-1]})" if errors else "")
-    return prices
+    reason = " | ".join(diag_errors[:3]) if diag_errors else "عدم پاسخ API تبدیل (احتمال محدودیت IP سرور روی Render)"
+    last_fetch_info = reason
+    return {}
 
 
 def _update_candle(candles, cur, bucket_ts, price, max_keep=120):
-    closed = False
     if cur is None:
-        cur = {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
-    elif cur["bucket_ts"] == bucket_ts:
+        return {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
+    if cur["bucket_ts"] == bucket_ts:
         cur["high"] = max(cur["high"], price)
         cur["low"] = min(cur["low"], price)
         cur["close"] = price
-    else:
-        candles.append(dict(cur))
-        if len(candles) > max_keep:
-            candles.pop(0)
-        closed = True
-        cur = {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
-    return cur, closed
+        return cur
+    candles.append(dict(cur))
+    if len(candles) > max_keep:
+        candles.pop(0)
+    return {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
 
 
 def update_market_candles():
@@ -318,7 +339,6 @@ def update_market_candles():
     now_ts = int(time.time())
     fast_ts = (now_ts // FAST_TF_SECONDS) * FAST_TF_SECONDS
     trend_ts = (now_ts // TREND_TF_SECONDS) * TREND_TF_SECONDS
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     with state_lock:
         for sym, (price, raw_s) in prices.items():
@@ -326,9 +346,8 @@ def update_market_candles():
             st = market_state[sym]
             st["price"] = price
             st["price_raw"] = raw_s
-            st["updated_at"] = now_str
-            st["fast_cur"], _ = _update_candle(st["fast_candles"], st["fast_cur"], fast_ts, price)
-            st["trend_cur"], _ = _update_candle(st["trend_candles"], st["trend_cur"], trend_ts, price)
+            st["fast_cur"] = _update_candle(st["fast_candles"], st["fast_cur"], fast_ts, price)
+            st["trend_cur"] = _update_candle(st["trend_candles"], st["trend_cur"], trend_ts, price)
 
     return True, len(prices)
 
@@ -341,27 +360,6 @@ def calc_ema(values, period):
     for v in values[1:]:
         ema = v * k + ema * (1.0 - k)
     return ema
-
-
-def calc_rsi(closes, period=6):
-    if len(closes) <= period:
-        return 50.0
-    gains = []
-    losses = []
-    for i in range(-period, 0):
-        diff = closes[i] - closes[i - 1]
-        if diff >= 0:
-            gains.append(diff)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(abs(diff))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 74.0 if avg_gain > 0 else 50.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def evaluate_symbol(sym: str):
@@ -383,10 +381,9 @@ def evaluate_symbol(sym: str):
     score = 0
     reasons = []
 
-    if len(closes) >= 2:
-        prev_c, last_c = closes[-2], closes[-1]
-        step_pct = ((last_c - prev_c) / prev_c) * 100.0 if prev_c > 0 else 0.0
-        if step_pct > 0.05:
+    if len(closes) >= 2 and closes[-2] > 0:
+        step_pct = ((closes[-1] - closes[-2]) / closes[-2]) * 100.0
+        if step_pct > 0.03:
             score += 2
             reasons.append(f"رشد لحظه‌ای {step_pct:+.2f}%")
         elif step_pct < -0.35:
@@ -399,20 +396,10 @@ def evaluate_symbol(sym: str):
         if price >= ema_fast >= ema_slow:
             score += 2
             reasons.append("هم‌راستایی EMA کوتاه")
-        elif price < ema_fast:
-            score -= 1
-
-        rsi = calc_rsi(closes, period=min(5, len(closes) - 1))
-        if 45.0 <= rsi <= 76.0:
-            score += 1
-            reasons.append(f"RSI مناسب ({rsi:.0f})")
-        elif rsi > 80.0:
-            score -= 1
-            reasons.append("اشباع خرید")
 
     if f_cur and f_cur.get("open", 0) > 0:
         body_pct = ((f_cur["close"] - f_cur["open"]) / f_cur["open"]) * 100.0
-        if body_pct > 0.05:
+        if body_pct > 0.03:
             score += 1
             reasons.append(f"کندل سبز ({body_pct:+.2f}%)")
 
@@ -422,15 +409,11 @@ def evaluate_symbol(sym: str):
             score += 1
             reasons.append("روند کوتاه مثبت")
 
-    # محاسبه دقیق ورود، تارگت خروج و حد ضرر با لحاظ کارمزد رفت‌وبرگشت
     entry_price = price
     target_price = entry_price * (1.0 + GROSS_TARGET_PCT / 100.0)
     stop_price = entry_price * (1.0 + STOP_LOSS_PCT / 100.0)
     net_profit_pct = GROSS_TARGET_PCT - ROUND_TRIP_FEE_PCT
-
-    # مثال سود خالص برای یک معامله فرضی 1,000,000 تومانی
-    sample_capital = 1_000_000.0
-    net_profit_per_1m = sample_capital * (net_profit_pct / 100.0)
+    net_profit_per_1m = 1_000_000.0 * (net_profit_pct / 100.0)
 
     return {
         "symbol": sym,
@@ -445,20 +428,20 @@ def evaluate_symbol(sym: str):
         "fee_round_pct": ROUND_TRIP_FEE_PCT,
         "stop_loss_pct": STOP_LOSS_PCT,
         "net_profit_per_1m": net_profit_per_1m,
-        "reasons": "، ".join(reasons) if reasons else "پایش اولیه قیمت زنده",
+        "reasons": "، ".join(reasons) if reasons else "قیمت زنده تبدیل",
     }
 
 
 def format_signal_message(sig: dict) -> str:
     return (
-        f"⚡ <b>سیگنال فوری در تبدیل | {sig['symbol']}</b> [<code>{RUN_ID}</code>]\n"
-        f"• <b>ارز / بازار:</b> <code>{sig['symbol']}</code>\n"
-        f"• <b>قیمت ورود:</b> <code>{format_price_irt(sig['entry_price'], sig['price_raw'])}</code>\n"
-        f"• <b>تارگت خروج:</b> <code>{format_price_irt(sig['target_price'])}</code> (خام: <code>+{sig['gross_target_pct']:.2f}%</code>)\n"
+        f"⚡ <b>سیگنال تبدیل | {sig['symbol']}</b> [<code>{RUN_ID}</code>]\n"
+        f"• <b>ارز:</b> <code>{sig['symbol']}</code>\n"
+        f"• <b>ورود:</b> <code>{format_price_irt(sig['entry_price'], sig['price_raw'])}</code>\n"
+        f"• <b>تارگت خروج:</b> <code>{format_price_irt(sig['target_price'])}</code> (<code>+{sig['gross_target_pct']:.2f}%</code>)\n"
         f"• <b>حد ضرر:</b> <code>{format_price_irt(sig['stop_price'])}</code> (<code>{sig['stop_loss_pct']:+.2f}%</code>)\n"
-        f"• <b>سود خالص تا تارگت (پس از {sig['fee_round_pct']:.2f}% کارمزد):</b> "
-        f"<b>+{sig['net_profit_pct']:.2f}%</b> (~<code>+{round(sig['net_profit_per_1m']):,} تومان</code> به ازای هر ۱ میلیون تومان)\n"
-        f"• <b>امتیاز:</b> <b>{sig['score']}</b> | <i>{sig['reasons']}</i>"
+        f"• <b>سود خالص پس از کارمزد ({sig['fee_round_pct']:.2f}%):</b> "
+        f"<b>+{sig['net_profit_pct']:.2f}%</b> (~<code>+{round(sig['net_profit_per_1m']):,} تومان</code> به ازای ۱ میلیون)\n"
+        f"• <i>{sig['reasons']}</i>"
     )
 
 
@@ -468,7 +451,7 @@ def scan_and_dispatch_signals(manual: bool = False):
         if manual:
             send_telegram_message(
                 f"⚠️ <b>دریافت قیمت زنده از تبدیل ناموفق بود</b> [<code>{RUN_ID}</code>]\n"
-                f"• وضعیت: <code>{last_fetch_info}</code>",
+                f"• علت: <code>{last_fetch_info}</code>"
             )
         return []
 
@@ -488,20 +471,14 @@ def scan_and_dispatch_signals(manual: bool = False):
     with state_lock:
         for ev in candidates:
             sym = ev["symbol"]
-            last_t = last_sent_ts.get(sym, 0.0)
-            if manual or (now_ts - last_t) >= PER_SYMBOL_COOLDOWN_SEC:
+            if manual or (now_ts - last_sent_ts.get(sym, 0.0)) >= PER_SYMBOL_COOLDOWN_SEC:
                 last_sent_ts[sym] = now_ts
                 to_send.append(ev)
 
     if manual and not to_send:
-        # اگر در لحظه دقیق هیچ ارزی به امتیاز نرسیده بود، بهترین گزینه‌های دارای قیمت زنده را با محاسبه سود خالص نمایش می‌دهد
-        fallback_list = []
-        for sym in syms:
-            ev = evaluate_symbol(sym)
-            if ev:
-                fallback_list.append(ev)
-        fallback_list.sort(key=lambda x: x["score"], reverse=True)
-        to_send = fallback_list[:5]
+        fallback = [ev for sym in syms if (ev := evaluate_symbol(sym))]
+        fallback.sort(key=lambda x: x["score"], reverse=True)
+        to_send = fallback[:5]
 
     for ev in to_send[:10]:
         send_telegram_message(format_signal_message(ev))
@@ -517,18 +494,17 @@ def build_status_details() -> str:
         info = last_fetch_info
         ok = last_fetch_ok
 
-    state_label = "🟢 روشن و فعال" if enabled else "🔴 خاموش"
-    conn_label = "🟢 متصل به تبدیل" if ok else "🟡 در حال تلاش برای اتصال"
+    state_label = "🟢 روشن" if enabled else "🔴 خاموش"
+    conn_label = "🟢 متصل" if ok else "🟡 ناموفق"
     net_pct = GROSS_TARGET_PCT - ROUND_TRIP_FEE_PCT
 
     return (
-        f"📊 <b>جزئیات کامل ربات سیگنال تبدیل</b> [<code>{RUN_ID}</code>]\n"
-        f"• وضعیت ربات: <b>{state_label}</b>\n"
-        f"• اتصال قیمت: <b>{conn_label}</b> ({priced}/{total_syms} بازار IRT)\n"
-        f"• منبع دریافت: <code>{info}</code>\n"
-        f"• کارمزد رفت‌وبرگشت لحاظ‌شده: <code>{ROUND_TRIP_FEE_PCT:.2f}%</code>\n"
-        f"• تارگت خروج: <code>+{GROSS_TARGET_PCT:.2f}%</code> | <b>سود خالص پس از کارمزد: +{net_pct:.2f}%</b>\n"
-        f"• حد ضرر پیشنهادی: <code>{STOP_LOSS_PCT:+.2f}%</code>\n"
+        f"📊 <b>جزئیات ربات سیگنال تبدیل</b> [<code>{RUN_ID}</code>]\n"
+        f"• وضعیت: <b>{state_label}</b> | اتصال قیمت: <b>{conn_label}</b> ({priced}/{total_syms} IRT)\n"
+        f"• جزئیات اتصال: <code>{info}</code>\n"
+        f"• کارمزد رفت‌وبرگشت: <code>{ROUND_TRIP_FEE_PCT:.2f}%</code>\n"
+        f"• تارگت: <code>+{GROSS_TARGET_PCT:.2f}%</code> | <b>سود خالص پس از کارمزد: +{net_pct:.2f}%</b>\n"
+        f"• حد ضرر: <code>{STOP_LOSS_PCT:+.2f}%</code>\n"
         f"• دستورها: <code>/start</code> | <code>/stop</code> | <code>/signal</code>"
     )
 
@@ -541,7 +517,7 @@ def handle_command(raw_text: str, chat_id: str):
         with state_lock:
             signal_active = True
         send_telegram_message(
-            f"🚀 <b>ربات سیگنال‌دهنده تبدیل روشن شد و سیگنال‌گیری آغاز گردید!</b> [<code>{RUN_ID}</code>]\n\n"
+            f"🚀 <b>ربات سیگنال تبدیل روشن شد و سیگنال‌گیری آغاز گردید!</b> [<code>{RUN_ID}</code>]\n\n"
             + build_status_details(),
             chat_id,
         )
@@ -551,8 +527,8 @@ def handle_command(raw_text: str, chat_id: str):
         with state_lock:
             signal_active = False
         send_telegram_message(
-            f"🛑 <b>ربات سیگنال‌دهنده تبدیل خاموش شد.</b> [<code>{RUN_ID}</code>]\n"
-            "برای شروع مجدد دستور <code>/start</code> را بفرستید.",
+            f"🛑 <b>ربات سیگنال تبدیل خاموش شد.</b> [<code>{RUN_ID}</code>]\n"
+            "برای شروع دوباره دستور <code>/start</code> را بفرستید.",
             chat_id,
         )
 
@@ -561,14 +537,14 @@ def handle_command(raw_text: str, chat_id: str):
             is_on = signal_active
         if not is_on:
             send_telegram_message(
-                f"🔴 ربات در حال حاضر خاموش است. ابتدا <code>/start</code> را بزنید. [<code>{RUN_ID}</code>]",
+                f"🔴 ربات خاموش است. ابتدا <code>/start</code> را بفرستید. [<code>{RUN_ID}</code>]",
                 chat_id,
             )
             return
         sent = scan_and_dispatch_signals(manual=True)
         if not sent:
             send_telegram_message(
-                f"ℹ️ در حال حاضر قیمت زنده‌ای از تبدیل دریافت نشد؛ کمی بعد دوباره <code>/signal</code> بزنید. [<code>{RUN_ID}</code>]",
+                f"⚠️ قیمت زنده‌ای از تبدیل دریافت نشد؛ علت: <code>{last_fetch_info}</code> [<code>{RUN_ID}</code>]",
                 chat_id,
             )
 
@@ -607,7 +583,7 @@ def main_loop():
         f"✅ <b>ربات سیگنال تبدیل آماده است.</b> [<code>{RUN_ID}</code>]\n"
         "• <code>/start</code> — شروع فوری سیگنال‌گیری و جزئیات کامل\n"
         "• <code>/stop</code> — خاموش کردن ربات\n"
-        "• <code>/signal</code> — بررسی فوری بازارهای تومانی و اعلام سود خالص تا تارگت"
+        "• <code>/signal</code> — بررسی بازارهای تومانی و اعلام سود خالص تا تارگت"
     )
     while True:
         ensure_polling_alive()
