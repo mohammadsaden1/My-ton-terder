@@ -29,7 +29,7 @@ TREND_TF_SECONDS = int(os.environ.get("TREND_TF_SECONDS", "180"))
 FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))
 ROUND_TRIP_FEE_PCT = FEE_RATE * 200.0
 
-# سود کم و منطقی: تارگت ناخالص 0.85% => سود خالص پس از 0.40% کارمزد حدود +0.45%
+# سود کم و منطقی با پوشش کامل کارمزد رفت‌وبرگشت
 MIN_GROSS_TARGET_PCT = ROUND_TRIP_FEE_PCT + 0.45
 GROSS_TARGET_PCT = max(float(os.environ.get("GROSS_TARGET_PCT", "0.85")), MIN_GROSS_TARGET_PCT)
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-0.55"))
@@ -56,7 +56,7 @@ API_BASES = [
 
 http_session = requests.Session()
 http_session.headers.update({
-    "User-Agent": "Mozilla/5.0 TabdealSignalBot/3.0",
+    "User-Agent": "Mozilla/5.0 TabdealSignalBot/3.1",
     "Accept": "application/json",
 })
 if TABDEAL_PROXY_URL:
@@ -215,7 +215,7 @@ def fetch_all_irt_prices_from_tabdeal():
     diag_errors = []
 
     if spot_client is not None:
-        for method_name in ("exchange_info", "get_exchange_info", "ticker_24hr", "get_ticker"):
+        for method_name in ("exchange_info", "get_exchange_info"):
             if hasattr(spot_client, method_name):
                 try:
                     res = getattr(spot_client, method_name)()
@@ -237,7 +237,7 @@ def fetch_all_irt_prices_from_tabdeal():
 
     if not prices:
         for base in API_BASES:
-            for ep in ("/r/api/v1/exchangeInfo", "/api/v1/exchangeInfo", "/r/api/v1/ticker/24hr"):
+            for ep in ("/r/api/v1/exchangeInfo", "/api/v1/exchangeInfo"):
                 url = f"{base}{ep}"
                 try:
                     resp = http_session.get(url, timeout=8)
@@ -271,6 +271,7 @@ def fetch_all_irt_prices_from_tabdeal():
                 try:
                     probe = http_session.get(url, params={"symbol": "BTC_IRT", "limit": 5}, timeout=6)
                     if probe.status_code != 200:
+                        diag_errors.append(f"{ep}->{probe.status_code}")
                         continue
                     for sym in syms_to_check:
                         try:
@@ -297,8 +298,8 @@ def fetch_all_irt_prices_from_tabdeal():
                             continue
                     if prices:
                         break
-                except Exception:
-                    continue
+                except Exception as e:
+                    diag_errors.append(f"{ep}:{type(e).__name__}")
             if prices:
                 break
 
