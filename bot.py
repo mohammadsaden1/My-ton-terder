@@ -1,19 +1,10 @@
 import os
 import time
 import uuid
-import random
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
-
-try:
-    from tabdeal.spot import Spot
-    from tabdeal.enums import OrderSides, OrderTypes
-except Exception:
-    Spot = None
-    OrderSides = None
-    OrderTypes = None
 
 DEFAULT_TOKEN = "9080285155:AAHuZFiALLtk9Sstk1jTFFZN0PwPLWFhgWM"
 DEFAULT_CHAT_ID = "1951133060"
@@ -22,33 +13,26 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", DEFAULT_TOKEN).strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", DEFAULT_CHAT_ID).strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
-TABDEAL_API_KEY = os.environ.get("TABDEAL_API_KEY", "").strip()
-TABDEAL_API_SECRET = os.environ.get("TABDEAL_API_SECRET", "").strip()
+# بازه پایش و تایم‌فریم کوتاه
+SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "10"))
+FAST_TF_SECONDS = int(os.environ.get("FAST_TF_SECONDS", "30"))
+TREND_TF_SECONDS = int(os.environ.get("TREND_TF_SECONDS", "180"))
 
-LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").strip().lower() == "true"
-
-SAMPLE_SECONDS = int(os.environ.get("SAMPLE_SECONDS", "15"))
-FAST_TF_SECONDS = int(os.environ.get("FAST_TF_SECONDS", "60"))
-TREND_TF_SECONDS = int(os.environ.get("TREND_TF_SECONDS", "300"))
-
-INITIAL_IRT_BALANCE = float(os.environ.get("INITIAL_IRT_BALANCE", "10000000.0"))
-TRADE_ALLOCATION_PCT = float(os.environ.get("TRADE_ALLOCATION_PCT", "0.10"))
+# کارمزد هر سمت در تبدیل (مثلاً 0.002 یعنی 0.2% => رفت‌وبرگشت 0.4%)
 FEE_RATE = float(os.environ.get("FEE_RATE", "0.002"))
+ROUND_TRIP_FEE_PCT = FEE_RATE * 200.0
 
-MIN_NET_BUFFER_PCT = (FEE_RATE * 200.0) + 0.35
-TAKE_PROFIT_PCT = max(float(os.environ.get("TAKE_PROFIT_PCT", "1.15")), MIN_NET_BUFFER_PCT)
-STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-0.75"))
-BREAKEVEN_TRIGGER_PCT = max(float(os.environ.get("BREAKEVEN_TRIGGER_PCT", "0.65")), (FEE_RATE * 200.0) + 0.15)
-TRAILING_STOP_PCT = float(os.environ.get("TRAILING_STOP_PCT", "0.35"))
+# سود کم و منطقی: حداقل کارمزد رفت‌وبرگشت + حاشیه سود خالص واقعی
+MIN_GROSS_TARGET_PCT = ROUND_TRIP_FEE_PCT + 0.45
+GROSS_TARGET_PCT = max(float(os.environ.get("GROSS_TARGET_PCT", "0.85")), MIN_GROSS_TARGET_PCT)
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "-0.55"))
 
-COOLDOWN_CYCLES = int(os.environ.get("COOLDOWN_CYCLES", "2"))
-MAX_CONSECUTIVE_LOSSES = int(os.environ.get("MAX_CONSECUTIVE_LOSSES", "3"))
-DAILY_MAX_DRAWDOWN_PCT = float(os.environ.get("DAILY_MAX_DRAWDOWN_PCT", "-3.5"))
-MIN_SIGNAL_SCORE = int(os.environ.get("MIN_SIGNAL_SCORE", "4"))
+MIN_SIGNAL_SCORE = int(os.environ.get("MIN_SIGNAL_SCORE", "2"))
+PER_SYMBOL_COOLDOWN_SEC = int(os.environ.get("PER_SYMBOL_COOLDOWN_SEC", "120"))
 
 RUN_ID = str(uuid.uuid4())[:8]
 
-IRT_SYMBOLS = [
+SEED_IRT_SYMBOLS = [
     "ETH_IRT", "DOGE_IRT", "DOT_IRT", "PUMP_IRT", "ONDO_IRT", "BTTC_IRT", "DOGS_IRT", "SUI_IRT",
     "FLOKI_IRT", "MOG_IRT", "TURBO_IRT", "STRK_IRT", "HBAR_IRT", "BOME_IRT", "AXS_IRT", "SEI_IRT",
     "ICP_IRT", "GIGA_IRT", "CGPT_IRT", "FET_IRT", "MEME_IRT", "ARKM_IRT", "AXL_IRT", "BONK_IRT",
@@ -58,196 +42,78 @@ IRT_SYMBOLS = [
     "TON_IRT",
 ]
 
-BASE_SIM_PRICES_IRT = {
-    "BTC_IRT": 6200000000.0,
-    "ETH_IRT": 210000000.0,
-    "SOL_IRT": 13500000.0,
-    "TON_IRT": 420000.0,
-    "XRP_IRT": 145000.0,
-    "BNB_IRT": 45000000.0,
-    "ADA_IRT": 55000.0,
-    "AVAX_IRT": 2200000.0,
-    "DOT_IRT": 420000.0,
-    "LINK_IRT": 1250000.0,
-    "SUI_IRT": 240000.0,
-    "NEAR_IRT": 380000.0,
-    "DOGE_IRT": 22000.0,
-    "SHIB_IRT": 1.65,
-    "PEPE_IRT": 1.15,
-    "TRX_IRT": 16500.0,
-    "LTC_IRT": 6800000.0,
-    "XLM_IRT": 26000.0,
-    "HBAR_IRT": 18500.0,
-    "ONDO_IRT": 82000.0,
-    "SEI_IRT": 29000.0,
-    "ICP_IRT": 640000.0,
-    "FET_IRT": 95000.0,
-    "RENDER_IRT": 410000.0,
-    "TAO_IRT": 29000000.0,
-    "AAVE_IRT": 14500000.0,
-    "UNI_IRT": 620000.0,
-    "ARB_IRT": 52000.0,
-    "OP_IRT": 98000.0,
-    "FIL_IRT": 310000.0,
-    "ALGO_IRT": 19500.0,
-    "ATOM_IRT": 390000.0,
-    "SAND_IRT": 28000.0,
-    "MANA_IRT": 24000.0,
-    "AXS_IRT": 360000.0,
-    "GALA_IRT": 2100.0,
-    "CHZ_IRT": 4800.0,
-    "FLOW_IRT": 49000.0,
-    "EOS_IRT": 52000.0,
-    "THETA_IRT": 94000.0,
-    "VET_IRT": 2400.0,
-    "KAVA_IRT": 34000.0,
-    "CAKE_IRT": 185000.0,
-    "CRV_IRT": 46000.0,
-    "LDO_IRT": 115000.0,
-    "PENDLE_IRT": 290000.0,
-    "RUNE_IRT": 220000.0,
-    "TIA_IRT": 340000.0,
-    "JUP_IRT": 58000.0,
-    "WIF_IRT": 88000.0,
-    "BONK_IRT": 1.85,
-    "FLOKI_IRT": 9.8,
-    "ORDI_IRT": 1850000.0,
-    "STX_IRT": 92000.0,
-    "IMX_IRT": 68000.0,
-    "EGLD_IRT": 1950000.0,
-    "NEO_IRT": 820000.0,
-    "QTUM_IRT": 210000.0,
-    "WAVES_IRT": 110000.0,
-    "ZEC_IRT": 2800000.0,
-    "DASH_IRT": 1950000.0,
-    "ETC_IRT": 1750000.0,
-    "COMP_IRT": 4200000.0,
-    "MKR_IRT": 98000000.0,
-    "SNX_IRT": 115000.0,
-    "SUSHI_IRT": 54000.0,
-    "1INCH_IRT": 21000.0,
-    "YFI_IRT": 420000000.0,
-    "ENJ_IRT": 12500.0,
-    "BAT_IRT": 16500.0,
-    "ZRX_IRT": 24500.0,
-    "ANKR_IRT": 1950.0,
-    "ICX_IRT": 11000.0,
-    "ONT_IRT": 14500.0,
-    "ZIL_IRT": 1350.0,
-    "RVN_IRT": 1250.0,
-    "DGB_IRT": 680.0,
-    "SC_IRT": 390.0,
-    "HOT_IRT": 145.0,
-    "BTT_IRT": 68.0,
-    "WIN_IRT": 5.8,
-    "CKB_IRT": 620.0,
-    "ONE_IRT": 1250.0,
-    "CELO_IRT": 39000.0,
-    "KSM_IRT": 1650000.0,
-    "ASTR_IRT": 3400.0,
-    "ROSE_IRT": 4900.0,
-    "MINA_IRT": 29500.0,
-    "GMX_IRT": 1450000.0,
-    "DYDX_IRT": 54000.0,
-    "PYTH_IRT": 16500.0,
-    "STRK_IRT": 19500.0,
-    "ZK_IRT": 7800.0,
-    "EIGEN_IRT": 115000.0,
-    "PUMP_IRT": 250.0,
-    "BTTC_IRT": 68.0,
-    "DOGS_IRT": 42.0,
-    "MOG_IRT": 85.0,
-    "TURBO_IRT": 310.0,
-    "BOME_IRT": 220.0,
-    "GIGA_IRT": 180.0,
-    "CGPT_IRT": 9200.0,
-    "MEME_IRT": 195.0,
-    "ARKM_IRT": 54000.0,
-    "AXL_IRT": 24000.0,
-    "FLUX_IRT": 26000.0,
-    "COW_IRT": 21000.0,
-    "NOT_IRT": 260.0,
-    "JASMY_IRT": 1450.0,
-    "FLR_IRT": 1350.0,
-    "XCN_IRT": 1250.0,
-    "BABYDOGE_IRT": 145.0,
-    "DUSK_IRT": 9500.0,
-    "HYPE_IRT": 1450000.0,
-    "HAEDAL_IRT": 4500.0,
-    "CAT_IRT": 120.0,
-    "XMR_IRT": 14500000.0,
-    "ACH_IRT": 1650.0,
-}
+API_BASES = [
+    "https://api.tabdeal.org",
+    "https://api1.tabdeal.org",
+    "https://api2.tabdeal.org",
+]
 
-market_state = {
-    sym: {
-        "last_price": None,
-        "last_price_raw": None,
-        "last_updated": None,
-        "sim_price": BASE_SIM_PRICES_IRT.get(sym, 10000.0),
-        "sim_drift": random.uniform(-0.0015, 0.0022),
-        "fast_candles": [],
-        "fast_cur": None,
-        "trend_candles": [],
-        "trend_cur": None,
-    }
-    for sym in IRT_SYMBOLS
-}
+API_PREFIXES = [
+    "/r/api/v1",
+    "/api/v1",
+    "/spot/api/v1",
+    "/v1",
+]
 
-spot_client = (
-    Spot(TABDEAL_API_KEY, TABDEAL_API_SECRET)
-    if (Spot is not None and TABDEAL_API_KEY and TABDEAL_API_SECRET)
-    else None
-)
 http_session = requests.Session()
-http_session.headers.update({"User-Agent": "Mozilla/5.0 TabdealTraderBot/1.0"})
+http_session.headers.update({
+    "User-Agent": "Mozilla/5.0 TabdealPrecisionSignalBot/2.0",
+    "Accept": "application/json",
+})
 
+active_symbols = list(SEED_IRT_SYMBOLS)
+market_state = {}
+last_sent_ts = {}
 last_update_id = 0
-using_fallback_feed = False
-trade_counter = 0
-cooldown_remaining = 0
-consecutive_losses = 0
-trading_enabled = True
-auto_paused_risk = False
-day_tag = datetime.utcnow().strftime("%Y-%m-%d")
-day_start_equity = INITIAL_IRT_BALANCE
-
-balance_irt = INITIAL_IRT_BALANCE
-open_position = None
-closed_trades = []
+signal_active = True
+last_fetch_info = "در حال اتصال به تبدیل..."
+last_fetch_ok = False
 polling_thread = None
 state_lock = threading.Lock()
 
 
-def format_irt(value, raw_str: str = None, with_unit: bool = True) -> str:
+def ensure_symbol_state(sym: str):
+    if sym not in market_state:
+        market_state[sym] = {
+            "price": None,
+            "price_raw": None,
+            "updated_at": None,
+            "fast_candles": [],
+            "fast_cur": None,
+            "trend_candles": [],
+            "trend_cur": None,
+        }
+
+
+for _s in SEED_IRT_SYMBOLS:
+    ensure_symbol_state(_s)
+
+
+def format_price_irt(value: float, raw_str: str = None) -> str:
+    """نمایش دقیق قیمت تومانی با حفظ ارقام اعشاری واقعی دریافت‌شده از صرافی"""
     if raw_str is not None and str(raw_str).strip() != "":
         s = str(raw_str).strip().replace(",", "")
         try:
-            fval = float(s)
+            float(s)
             if "." in s:
-                int_part, dec_part = s.split(".", 1)
-                dec_part = dec_part.rstrip("0")
-                int_fmt = f"{int(float(int_part)):,}" if int_part not in ("", "-") else int_part
-                out = f"{int_fmt}.{dec_part}" if dec_part else int_fmt
-            else:
-                out = f"{int(fval):,}"
-            return f"{out} تومان" if with_unit else out
+                ip, dp = s.split(".", 1)
+                dp = dp.rstrip("0")
+                ip_fmt = f"{int(float(ip)):,}" if ip not in ("", "-") else ip
+                return f"{ip_fmt}.{dp} تومان" if dp else f"{ip_fmt} تومان"
+            return f"{int(float(s)):,} تومان"
         except Exception:
             pass
 
     if value is None:
         return "نامشخص"
     val = float(value)
-    if val.is_integer():
-        out = f"{int(val):,}"
-    else:
-        s = f"{val:.8f}".rstrip("0").rstrip(".")
-        if "." in s:
-            ip, dp = s.split(".", 1)
-            out = f"{int(ip):,}.{dp}"
-        else:
-            out = f"{int(s):,}"
-    return f"{out} تومان" if with_unit else out
+    if val >= 100 or val.is_integer():
+        return f"{round(val):,} تومان"
+    s = f"{val:.8f}".rstrip("0").rstrip(".")
+    if "." in s:
+        ip, dp = s.split(".", 1)
+        return f"{int(ip):,}.{dp} تومان"
+    return f"{int(s):,} تومان"
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -255,7 +121,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(f"Tabdeal IRT Precision Trader ({RUN_ID}) active".encode("utf-8"))
+        self.wfile.write(f"Tabdeal Signal Bot ({RUN_ID}) active".encode("utf-8"))
 
     def log_message(self, format, *args):
         return
@@ -276,7 +142,7 @@ def send_telegram_message(text: str, chat_id: str = None):
         res = http_session.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": target_chat, "text": text, "parse_mode": "HTML"},
-            timeout=8,
+            timeout=10,
         )
         return res.status_code == 200
     except Exception as e:
@@ -284,176 +150,187 @@ def send_telegram_message(text: str, chat_id: str = None):
         return False
 
 
-def _extract_price_from_obj(obj):
+def _normalize_irt_symbol(raw_sym: str):
+    if not raw_sym:
+        return None
+    s = str(raw_sym).strip().upper().replace("-", "_").replace("/", "_")
+    if s.endswith("_IRT") and len(s) > 4:
+        return s
+    if s.endswith("IRT") and len(s) > 3 and "_" not in s:
+        base = s[:-3]
+        return f"{base}_IRT"
+    return None
+
+
+def _extract_price(obj: dict):
     if not isinstance(obj, dict):
         return None, None
-    for key in ("lastPrice", "last_price", "price", "close", "mid", "ask", "bid"):
-        val = obj.get(key)
+    for k in ("lastPrice", "last_price", "price", "close", "mid", "ask", "bid", "markPrice"):
+        val = obj.get(k)
         if val is not None and str(val).strip() != "":
+            raw_s = str(val).strip()
             try:
-                fval = float(str(val).replace(",", "").strip())
+                fval = float(raw_s.replace(",", ""))
                 if fval > 0:
-                    return fval, str(val).strip()
+                    return fval, raw_s
             except Exception:
                 continue
     return None, None
 
 
-def _parse_rows_into_prices(rows, prices):
-    wanted_with_us = set(IRT_SYMBOLS)
-    wanted_no_us = {s.replace("_", "") for s in IRT_SYMBOLS}
-    rev_map = {s.replace("_", ""): s for s in IRT_SYMBOLS}
-
-    if isinstance(rows, dict):
-        rows = [
-            dict(v, symbol=k) if isinstance(v, dict) else {"symbol": k, "price": v}
-            for k, v in rows.items()
-        ]
-    if not isinstance(rows, list):
-        return
-
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        raw_sym = str(
-            row.get("symbol") or row.get("pair") or row.get("market") or row.get("tabdealSymbol") or ""
-        ).upper()
-        target_sym = None
-        if raw_sym in wanted_with_us:
-            target_sym = raw_sym
-        elif raw_sym in wanted_no_us:
-            target_sym = rev_map.get(raw_sym)
-        if target_sym and target_sym not in prices:
-            p, raw_s = _extract_price_from_obj(row)
-            if p is not None:
-                prices[target_sym] = (p, raw_s)
+def _extract_rows(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for k in ("data", "result", "tickers", "symbols", "markets", "items"):
+            val = payload.get(k)
+            if isinstance(val, list):
+                return val
+            if isinstance(val, dict):
+                rows = []
+                for sym_k, sym_v in val.items():
+                    if isinstance(sym_v, dict):
+                        row = dict(sym_v)
+                        row.setdefault("symbol", sym_k)
+                        rows.append(row)
+                    else:
+                        rows.append({"symbol": sym_k, "price": sym_v})
+                return rows
+    return []
 
 
-def fetch_irt_prices_map():
-    """تلاش برای دریافت قیمت زنده از تبدیل؛ در صورت عدم پاسخ فید پشتیبان بازار را فعال می‌کند تا ترید متوقف نشود"""
-    global using_fallback_feed
+def fetch_all_irt_prices_from_tabdeal():
+    """دریافت قیمت لحظه‌ای دقیق همه بازارهای تومانی مستقیماً از تبدیل"""
+    global last_fetch_info, last_fetch_ok, active_symbols
+
     prices = {}
+    discovered = set(SEED_IRT_SYMBOLS)
+    errors = []
 
-    if spot_client is not None:
-        for name in ("get_ticker", "ticker", "get_all_tickers", "tickers", "get_24hr_ticker", "get_markets", "markets"):
-            if hasattr(spot_client, name):
+    bulk_endpoints = ["/ticker/price", "/ticker/24hr", "/ticker", "/exchangeInfo", "/markets", "/symbols"]
+
+    for base in API_BASES:
+        for prefix in API_PREFIXES:
+            for ep in bulk_endpoints:
+                url = f"{base}{prefix}{ep}"
                 try:
-                    res = getattr(spot_client, name)()
-                    data = res.get("data", res) if isinstance(res, dict) else res
-                    _parse_rows_into_prices(data, prices)
+                    resp = http_session.get(url, timeout=8)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    rows = _extract_rows(data)
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        raw_sym = (
+                            row.get("symbol")
+                            or row.get("pair")
+                            or row.get("market")
+                            or row.get("tabdealSymbol")
+                            or row.get("name")
+                        )
+                        norm_sym = _normalize_irt_symbol(raw_sym)
+                        if not norm_sym:
+                            continue
+                        discovered.add(norm_sym)
+                        p, raw_s = _extract_price(row)
+                        if p is not None and norm_sym not in prices:
+                            prices[norm_sym] = (p, raw_s)
                     if prices:
-                        break
-                except Exception:
-                    continue
+                        with state_lock:
+                            active_symbols = sorted(discovered)
+                            for s in active_symbols:
+                                ensure_symbol_state(s)
+                        last_fetch_ok = True
+                        last_fetch_info = f"متصل به {base}{prefix}{ep} ({len(prices)} بازار IRT)"
+                        return prices
+                except Exception as e:
+                    errors.append(f"{url}: {type(e).__name__}")
 
-        if not prices:
-            for name in ("get_ticker_price", "ticker_price", "get_order_book", "order_book", "get_recent_trades", "recent_trades"):
-                if hasattr(spot_client, name):
-                    fn = getattr(spot_client, name)
-                    for sym in IRT_SYMBOLS:
+    # اگر endpoint کلی قیمتی نداد، از دفتر سفارش (/depth) یا معاملات اخیر (/trades) برای هر نماد قیمت می‌گیریم
+    for base in API_BASES:
+        for prefix in API_PREFIXES:
+            for ep, mode in (("/depth", "depth"), ("/trades", "trades")):
+                probe_url = f"{base}{prefix}{ep}"
+                try:
+                    probe = http_session.get(probe_url, params={"symbol": "BTC_IRT", "limit": 5}, timeout=6)
+                    if probe.status_code != 200:
+                        continue
+                    with state_lock:
+                        syms_to_check = list(active_symbols)
+                    for sym in syms_to_check:
                         try:
-                            res = fn(symbol=sym)
-                            if isinstance(res, dict):
-                                p, raw_s = _extract_price_from_obj(res)
-                                if p is not None:
-                                    prices[sym] = (p, raw_s)
-                                    continue
-                                bids = res.get("bids") or []
-                                asks = res.get("asks") or []
+                            r = http_session.get(probe_url, params={"symbol": sym, "limit": 5}, timeout=5)
+                            if r.status_code != 200:
+                                continue
+                            payload = r.json()
+                            if mode == "depth" and isinstance(payload, dict):
+                                bids = payload.get("bids") or []
+                                asks = payload.get("asks") or []
                                 if bids and asks:
-                                    b_p = float(bids[0][0])
-                                    a_p = float(asks[0][0])
+                                    b_p = float(str(bids[0][0]).replace(",", ""))
+                                    a_p = float(str(asks[0][0]).replace(",", ""))
                                     if b_p > 0 and a_p > 0:
                                         mid_p = (b_p + a_p) / 2.0
                                         prices[sym] = (mid_p, str(mid_p))
-                            elif isinstance(res, list) and res and isinstance(res[-1], dict):
-                                p, raw_s = _extract_price_from_obj(res[-1])
-                                if p is not None:
-                                    prices[sym] = (p, raw_s)
+                            elif mode == "trades":
+                                t_list = _extract_rows(payload)
+                                if t_list and isinstance(t_list[0], dict):
+                                    p, raw_s = _extract_price(t_list[0])
+                                    if p is not None:
+                                        prices[sym] = (p, raw_s)
                         except Exception:
-                            break
+                            continue
                     if prices:
-                        break
+                        last_fetch_ok = True
+                        last_fetch_info = f"متصل به {base}{prefix}{ep} ({len(prices)}/{len(syms_to_check)} بازار IRT)"
+                        return prices
+                except Exception:
+                    continue
 
-    if prices:
-        using_fallback_feed = False
-        return prices
-
-    # فید پشتیبان حرکت قیمت تومانی تا موتور تحلیل و ترید بدون توقف کار کند
-    using_fallback_feed = True
-    with state_lock:
-        for sym in IRT_SYMBOLS:
-            st = market_state[sym]
-            if random.random() < 0.18:
-                st["sim_drift"] = random.uniform(-0.0032, 0.0038)
-            shock = random.gauss(st["sim_drift"], 0.0028)
-            new_p = max(0.01, st["sim_price"] * (1.0 + shock))
-            st["sim_price"] = new_p
-            prices[sym] = (new_p, None)
-
+    last_fetch_ok = False
+    last_fetch_info = "عدم دریافت قیمت از API تبدیل" + (f" ({errors[-1]})" if errors else "")
     return prices
 
 
-def execute_tabdeal_order(symbol: str, side: str, quantity: float):
-    if not LIVE_TRADING:
-        return {"simulated": True, "symbol": symbol, "side": side, "quantity": quantity}
-    if spot_client is None or OrderSides is None or OrderTypes is None:
-        raise RuntimeError("کلاینت تبدیل یا کلیدهای API آماده نیستند.")
-
-    order_side = OrderSides.BUY if side.upper() == "BUY" else OrderSides.SELL
-    return spot_client.new_order(
-        symbol=symbol,
-        side=order_side,
-        type=OrderTypes.MARKET,
-        quantity=str(quantity),
-    )
-
-
-def _update_candle_bucket(candles_list, cur_bucket, bucket_ts, price, max_keep=150):
+def _update_candle(candles, cur, bucket_ts, price, max_keep=120):
     closed = False
-    if cur_bucket is None:
-        cur_bucket = {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
-    elif cur_bucket["bucket_ts"] == bucket_ts:
-        cur_bucket["high"] = max(cur_bucket["high"], price)
-        cur_bucket["low"] = min(cur_bucket["low"], price)
-        cur_bucket["close"] = price
+    if cur is None:
+        cur = {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
+    elif cur["bucket_ts"] == bucket_ts:
+        cur["high"] = max(cur["high"], price)
+        cur["low"] = min(cur["low"], price)
+        cur["close"] = price
     else:
-        candles_list.append(dict(cur_bucket))
-        if len(candles_list) > max_keep:
-            candles_list.pop(0)
+        candles.append(dict(cur))
+        if len(candles) > max_keep:
+            candles.pop(0)
         closed = True
-        cur_bucket = {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
-    return cur_bucket, closed
+        cur = {"bucket_ts": bucket_ts, "open": price, "high": price, "low": price, "close": price}
+    return cur, closed
 
 
-def update_multi_tf_candles():
-    prices_map = fetch_irt_prices_map()
-    if not prices_map:
-        return False, False
+def update_market_candles():
+    prices = fetch_all_irt_prices_from_tabdeal()
+    if not prices:
+        return False, 0
 
     now_ts = int(time.time())
     fast_ts = (now_ts // FAST_TF_SECONDS) * FAST_TF_SECONDS
     trend_ts = (now_ts // TREND_TF_SECONDS) * TREND_TF_SECONDS
     now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    any_closed = False
 
     with state_lock:
-        for sym, (price, raw_str) in prices_map.items():
+        for sym, (price, raw_s) in prices.items():
+            ensure_symbol_state(sym)
             st = market_state[sym]
-            st["last_price"] = price
-            st["last_price_raw"] = raw_str
-            st["last_updated"] = now_str
+            st["price"] = price
+            st["price_raw"] = raw_s
+            st["updated_at"] = now_str
+            st["fast_cur"], _ = _update_candle(st["fast_candles"], st["fast_cur"], fast_ts, price)
+            st["trend_cur"], _ = _update_candle(st["trend_candles"], st["trend_cur"], trend_ts, price)
 
-            st["fast_cur"], f_closed = _update_candle_bucket(
-                st["fast_candles"], st["fast_cur"], fast_ts, price
-            )
-            st["trend_cur"], t_closed = _update_candle_bucket(
-                st["trend_candles"], st["trend_cur"], trend_ts, price
-            )
-            if f_closed or t_closed:
-                any_closed = True
-
-    return True, any_closed
+    return True, len(prices)
 
 
 def calc_ema(values, period):
@@ -466,7 +343,7 @@ def calc_ema(values, period):
     return ema
 
 
-def calc_rsi(closes, period=7):
+def calc_rsi(closes, period=6):
     if len(closes) <= period:
         return 50.0
     gains = []
@@ -482,515 +359,218 @@ def calc_rsi(closes, period=7):
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
     if avg_loss == 0:
-        return 75.0 if avg_gain > 0 else 50.0
+        return 74.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def calc_volatility_pct(candles):
-    if not candles:
-        return 0.0
-    sub = candles[-6:]
-    ranges = []
-    for c in sub:
-        if c["low"] > 0:
-            ranges.append(((c["high"] - c["low"]) / c["low"]) * 100.0)
-    return (sum(ranges) / len(ranges)) if ranges else 0.0
-
-
-def analyze_symbol_smart(sym: str):
-    """تحلیل تکنیکال کوتاه‌مدت ترکیبی (EMA + MACD مومنتوم + RSI کوتاه + کندل‌شناسی + نوسان)"""
+def evaluate_symbol(sym: str):
     with state_lock:
-        st = market_state[sym]
+        st = market_state.get(sym)
+        if not st or st["price"] is None or st["price"] <= 0:
+            return None
+        price = st["price"]
+        price_raw = st["price_raw"]
         f_candles = list(st["fast_candles"])
+        f_cur = dict(st["fast_cur"]) if st["fast_cur"] else None
         t_candles = list(st["trend_candles"])
 
-    f_closes = [c["close"] for c in f_candles]
-    if len(f_closes) < 5 or not f_candles[-1] or f_candles[-1]["open"] <= 0:
-        return 0, 0.0, "در انتظار تشکیل کندل‌های کوتاه"
-
-    last_f = f_candles[-1]
-    body_pct = ((last_f["close"] - last_f["open"]) / last_f["open"]) * 100.0
-    upper_wick = max(0.0, last_f["high"] - max(last_f["open"], last_f["close"]))
-    lower_wick = max(0.0, min(last_f["open"], last_f["close"]) - last_f["low"])
-    candle_span = max(1e-12, last_f["high"] - last_f["low"])
-    wick_rejection = lower_wick / candle_span
-
-    ema_fast = calc_ema(f_closes, 3)
-    ema_mid = calc_ema(f_closes, 6)
-    ema_slow = calc_ema(f_closes, 12)
-    macd_line = calc_ema(f_closes, 4) - calc_ema(f_closes, 9)
-    rsi_short = calc_rsi(f_closes, period=6)
-    vol_pct = calc_volatility_pct(f_candles)
+    series = list(f_candles)
+    if f_cur:
+        series.append(f_cur)
+    closes = [c["close"] for c in series if c and c.get("close")]
 
     score = 0
     reasons = []
 
-    if 0.15 <= body_pct <= 1.25 and upper_wick <= candle_span * 0.45:
-        score += 2
-        reasons.append(f"کندل کوتاه سبز سالم ({body_pct:+.2f}%)")
-    elif body_pct > 1.25:
-        score -= 1
-        reasons.append("کندل کشیده (ریسک اصلاح)")
-    elif body_pct < -0.35:
-        score -= 2
-        reasons.append(f"کندل قرمز ({body_pct:+.2f}%)")
+    if len(closes) >= 2:
+        prev_c, last_c = closes[-2], closes[-1]
+        step_pct = ((last_c - prev_c) / prev_c) * 100.0 if prev_c > 0 else 0.0
+        if step_pct > 0.05:
+            score += 2
+            reasons.append(f"رشد لحظه‌ای {step_pct:+.2f}%")
+        elif step_pct < -0.35:
+            score -= 2
+            reasons.append(f"افت لحظه‌ای {step_pct:+.2f}%")
 
-    if wick_rejection >= 0.35 and body_pct >= 0:
-        score += 1
-        reasons.append("حمایت کف کندل")
-
-    if f_closes[-1] > ema_fast > ema_mid:
-        score += 2
-        reasons.append("هم‌راستایی EMA کوتاه")
-    elif f_closes[-1] < ema_fast:
-        score -= 1
-
-    if len(f_closes) >= 8 and ema_mid > ema_slow:
-        score += 1
-        reasons.append("روند کوتاه صعودی")
-
-    if macd_line > 0:
-        score += 1
-        reasons.append("مومنتوم مثبت")
-    else:
-        score -= 1
-
-    if 48.0 <= rsi_short <= 72.0:
-        score += 1
-        reasons.append(f"RSI مناسب ({rsi_short:.0f})")
-    elif rsi_short > 78.0:
-        score -= 2
-        reasons.append("اشباع خرید")
-
-    if len(t_candles) >= 2:
-        t_last = t_candles[-1]
-        if t_last["open"] > 0 and ((t_last["close"] - t_last["open"]) / t_last["open"]) * 100.0 >= 0.0:
-            score += 1
-            reasons.append("هم‌سو با کندل 5m")
-        else:
+    if len(closes) >= 3:
+        ema_fast = calc_ema(closes, 2)
+        ema_slow = calc_ema(closes, 5)
+        if price >= ema_fast >= ema_slow:
+            score += 2
+            reasons.append("هم‌راستایی EMA کوتاه")
+        elif price < ema_fast:
             score -= 1
 
-    min_needed_vol = (FEE_RATE * 200.0) + 0.25
-    if vol_pct >= min_needed_vol:
-        score += 1
-    else:
-        score -= 1
-        reasons.append("نوسان کم")
+        rsi = calc_rsi(closes, period=min(5, len(closes) - 1))
+        if 45.0 <= rsi <= 76.0:
+            score += 1
+            reasons.append(f"RSI مناسب ({rsi:.0f})")
+        elif rsi > 80.0:
+            score -= 1
+            reasons.append("اشباع خرید")
 
-    return score, body_pct, "، ".join(reasons) if reasons else "خنثی"
+    if f_cur and f_cur.get("open", 0) > 0:
+        body_pct = ((f_cur["close"] - f_cur["open"]) / f_cur["open"]) * 100.0
+        if body_pct > 0.05:
+            score += 1
+            reasons.append(f"کندل سبز ({body_pct:+.2f}%)")
+
+    if t_candles and t_candles[-1].get("open", 0) > 0:
+        t_pct = ((t_candles[-1]["close"] - t_candles[-1]["open"]) / t_candles[-1]["open"]) * 100.0
+        if t_pct >= 0:
+            score += 1
+            reasons.append("روند کوتاه مثبت")
+
+    # محاسبه دقیق ورود، تارگت خروج و حد ضرر با لحاظ کارمزد رفت‌وبرگشت
+    entry_price = price
+    target_price = entry_price * (1.0 + GROSS_TARGET_PCT / 100.0)
+    stop_price = entry_price * (1.0 + STOP_LOSS_PCT / 100.0)
+    net_profit_pct = GROSS_TARGET_PCT - ROUND_TRIP_FEE_PCT
+
+    # مثال سود خالص برای یک معامله فرضی 1,000,000 تومانی
+    sample_capital = 1_000_000.0
+    net_profit_per_1m = sample_capital * (net_profit_pct / 100.0)
+
+    return {
+        "symbol": sym,
+        "score": score,
+        "price": price,
+        "price_raw": price_raw,
+        "entry_price": entry_price,
+        "target_price": target_price,
+        "stop_price": stop_price,
+        "gross_target_pct": GROSS_TARGET_PCT,
+        "net_profit_pct": net_profit_pct,
+        "fee_round_pct": ROUND_TRIP_FEE_PCT,
+        "stop_loss_pct": STOP_LOSS_PCT,
+        "net_profit_per_1m": net_profit_per_1m,
+        "reasons": "، ".join(reasons) if reasons else "پایش اولیه قیمت زنده",
+    }
 
 
-def get_current_symbol_price(sym: str):
-    with state_lock:
-        st = market_state.get(sym)
-        if not st:
-            return None
-        if st["fast_cur"] and st["fast_cur"].get("close"):
-            return st["fast_cur"]["close"]
-        if st["fast_candles"]:
-            return st["fast_candles"][-1]["close"]
-        return st["last_price"]
+def format_signal_message(sig: dict) -> str:
+    return (
+        f"⚡ <b>سیگنال فوری در تبدیل | {sig['symbol']}</b> [<code>{RUN_ID}</code>]\n"
+        f"• <b>ارز / بازار:</b> <code>{sig['symbol']}</code>\n"
+        f"• <b>قیمت ورود:</b> <code>{format_price_irt(sig['entry_price'], sig['price_raw'])}</code>\n"
+        f"• <b>تارگت خروج:</b> <code>{format_price_irt(sig['target_price'])}</code> (خام: <code>+{sig['gross_target_pct']:.2f}%</code>)\n"
+        f"• <b>حد ضرر:</b> <code>{format_price_irt(sig['stop_price'])}</code> (<code>{sig['stop_loss_pct']:+.2f}%</code>)\n"
+        f"• <b>سود خالص تا تارگت (پس از {sig['fee_round_pct']:.2f}% کارمزد):</b> "
+        f"<b>+{sig['net_profit_pct']:.2f}%</b> (~<code>+{round(sig['net_profit_per_1m']):,} تومان</code> به ازای هر ۱ میلیون تومان)\n"
+        f"• <b>امتیاز:</b> <b>{sig['score']}</b> | <i>{sig['reasons']}</i>"
+    )
 
 
-def get_current_symbol_price_formatted(sym: str) -> str:
-    with state_lock:
-        st = market_state.get(sym)
-        raw_s = st.get("last_price_raw") if st else None
-        p = get_current_symbol_price(sym)
-    if p is None:
-        return "نامشخص"
-    if st and st.get("last_price") == p and raw_s:
-        return format_irt(p, raw_s, with_unit=True)
-    return format_irt(p, None, with_unit=True)
-
-
-def get_total_equity_irt():
-    eq = balance_irt
-    if open_position is not None:
-        curr_p = get_current_symbol_price(open_position["symbol"])
-        if curr_p and curr_p > 0:
-            eq += open_position["qty"] * curr_p * (1.0 - FEE_RATE)
-        else:
-            eq += open_position["spent_irt"]
-    return eq
-
-
-def check_daily_reset_and_risk_guards():
-    global day_tag, day_start_equity, auto_paused_risk
-
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    curr_eq = get_total_equity_irt()
-
-    if today != day_tag:
-        day_tag = today
-        day_start_equity = curr_eq
-        auto_paused_risk = False
-
-    if day_start_equity > 0:
-        daily_dd_pct = ((curr_eq - day_start_equity) / day_start_equity) * 100.0
-        if daily_dd_pct <= DAILY_MAX_DRAWDOWN_PCT and not auto_paused_risk:
-            auto_paused_risk = True
+def scan_and_dispatch_signals(manual: bool = False):
+    ok, priced_count = update_market_candles()
+    if not ok or priced_count == 0:
+        if manual:
             send_telegram_message(
-                f"🛡️ <b>محافظ ریسک روزانه فعال شد!</b> [<code>{RUN_ID}</code>]\n"
-                f"افت روزانه به <code>{daily_dd_pct:+.2f}%</code> رسید؛ ورود جدید تا روز بعد متوقف شد."
+                f"⚠️ <b>دریافت قیمت زنده از تبدیل ناموفق بود</b> [<code>{RUN_ID}</code>]\n"
+                f"• وضعیت: <code>{last_fetch_info}</code>",
             )
-
-
-def process_trading_step():
-    global balance_irt, open_position, trade_counter, cooldown_remaining, consecutive_losses, auto_paused_risk
+        return []
 
     with state_lock:
-        if not trading_enabled:
-            return
+        syms = list(active_symbols)
 
-    ok, any_closed = update_multi_tf_candles()
-    if not ok:
-        return
+    candidates = []
+    for sym in syms:
+        ev = evaluate_symbol(sym)
+        if ev and ev["score"] >= MIN_SIGNAL_SCORE:
+            candidates.append(ev)
 
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    candidates.sort(key=lambda x: x["score"], reverse=True)
 
+    now_ts = time.time()
+    to_send = []
     with state_lock:
-        if not trading_enabled:
-            return
+        for ev in candidates:
+            sym = ev["symbol"]
+            last_t = last_sent_ts.get(sym, 0.0)
+            if manual or (now_ts - last_t) >= PER_SYMBOL_COOLDOWN_SEC:
+                last_sent_ts[sym] = now_ts
+                to_send.append(ev)
 
-        check_daily_reset_and_risk_guards()
+    if manual and not to_send:
+        # اگر در لحظه دقیق هیچ ارزی به امتیاز نرسیده بود، بهترین گزینه‌های دارای قیمت زنده را با محاسبه سود خالص نمایش می‌دهد
+        fallback_list = []
+        for sym in syms:
+            ev = evaluate_symbol(sym)
+            if ev:
+                fallback_list.append(ev)
+        fallback_list.sort(key=lambda x: x["score"], reverse=True)
+        to_send = fallback_list[:5]
 
-        if open_position is not None:
-            sym = open_position["symbol"]
-            curr_price = get_current_symbol_price(sym)
-            if not curr_price or curr_price <= 0:
-                return
+    for ev in to_send[:10]:
+        send_telegram_message(format_signal_message(ev))
 
-            curr_price_txt = get_current_symbol_price_formatted(sym)
-            entry_p = open_position["entry_price"]
-            entry_p_txt = open_position.get("entry_price_txt") or format_irt(entry_p, None, with_unit=True)
-            qty = open_position["qty"]
+    return to_send
 
-            gross_pnl_pct = ((curr_price - entry_p) / entry_p) * 100.0
-            peak_pct = max(open_position.get("peak_pct", gross_pnl_pct), gross_pnl_pct)
-            open_position["peak_pct"] = peak_pct
 
-            eff_sl = STOP_LOSS_PCT
-            mode_txt = "حد ضرر کوتاه (خروج سریع در ضرر)"
-
-            if peak_pct >= BREAKEVEN_TRIGGER_PCT:
-                eff_sl = max(eff_sl, (FEE_RATE * 200.0) + 0.08)
-                mode_txt = "نقطه سر‌به‌سر (پوشش کارمزد)"
-
-            if peak_pct >= (BREAKEVEN_TRIGGER_PCT + TRAILING_STOP_PCT):
-                eff_sl = max(eff_sl, peak_pct - TRAILING_STOP_PCT)
-                mode_txt = "حد سود متحرک کوتاه"
-
-            exit_reason = None
-            if gross_pnl_pct >= TAKE_PROFIT_PCT:
-                exit_reason = f"هدف سود کوتاه ({TAKE_PROFIT_PCT:+.2f}%)"
-            elif gross_pnl_pct <= eff_sl:
-                exit_reason = f"{mode_txt} ({eff_sl:+.2f}%)"
-
-            if exit_reason:
-                try:
-                    execute_tabdeal_order(sym, "SELL", qty)
-                except Exception as e:
-                    send_telegram_message(f"⚠️ خطا در خروج {sym}: <code>{e}</code>")
-                    return
-
-                gross_irt = qty * curr_price
-                net_irt = gross_irt * (1.0 - FEE_RATE)
-                profit_irt = net_irt - open_position["spent_irt"]
-                net_pnl_pct = (profit_irt / open_position["spent_irt"]) * 100.0
-
-                balance_irt += net_irt
-                if profit_irt < 0:
-                    cooldown_remaining = COOLDOWN_CYCLES
-                    consecutive_losses += 1
-                    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES and not auto_paused_risk:
-                        auto_paused_risk = True
-                        send_telegram_message(
-                            f"🛡️ <b>توقف محافظتی پس از {consecutive_losses} ضرر متوالی!</b> [<code>{RUN_ID}</code>]\n"
-                            "ورودهای جدید موقتاً متوقف شد تا حساب حفظ شود."
-                        )
-                else:
-                    consecutive_losses = 0
-
-                rec = {
-                    "id": open_position["id"],
-                    "symbol": sym,
-                    "trade_type": open_position.get("trade_type", "چنج / خرید صعودی (LONG)"),
-                    "entry_price": entry_p,
-                    "entry_price_txt": entry_p_txt,
-                    "exit_price": curr_price,
-                    "exit_price_txt": curr_price_txt,
-                    "profit_irt": profit_irt,
-                    "pnl_pct": net_pnl_pct,
-                    "reason": exit_reason,
-                    "time": now_str,
-                }
-                closed_trades.append(rec)
-                open_position = None
-
-                send_telegram_message(
-                    f"📤 <b>خروج (چنج/فروش — SELL) #{rec['id']} | {sym}</b> [<code>{RUN_ID}</code>]\n"
-                    f"• نوع معامله: <b>{rec['trade_type']}</b>\n"
-                    f"• قیمت ورود (تومانی): <code>{entry_p_txt}</code>\n"
-                    f"• قیمت خروج (تومانی): <code>{curr_price_txt}</code>\n"
-                    f"• علت: <b>{exit_reason}</b>\n"
-                    f"• سود/ضرر خالص (پس از کارمزد): <code>{format_irt(profit_irt, None, with_unit=True)}</code> (<code>{net_pnl_pct:+.2f}%</code>)\n"
-                    f"• موجودی فرضی جدید: <b>{format_irt(balance_irt, None, with_unit=True)}</b>"
-                )
-            return
-
-        if not any_closed or auto_paused_risk:
-            return
-
-        if cooldown_remaining > 0:
-            cooldown_remaining -= 1
-            return
-
-    best_sym = None
-    best_score = MIN_SIGNAL_SCORE - 1
-    best_body = 0.0
-    best_reason = ""
-
-    for sym in IRT_SYMBOLS:
-        sc, body_p, rsn = analyze_symbol_smart(sym)
-        if sc >= MIN_SIGNAL_SCORE and sc > best_score:
-            best_score = sc
-            best_sym = sym
-            best_body = body_p
-            best_reason = rsn
-
+def build_status_details() -> str:
     with state_lock:
-        if not trading_enabled or auto_paused_risk or open_position is not None or not best_sym:
-            return
+        enabled = signal_active
+        priced = sum(1 for s in active_symbols if market_state.get(s, {}).get("price") is not None)
+        total_syms = len(active_symbols)
+        info = last_fetch_info
+        ok = last_fetch_ok
 
-        curr_p = get_current_symbol_price(best_sym)
-        if not curr_p or curr_p <= 0 or balance_irt < 50000:
-            return
+    state_label = "🟢 روشن و فعال" if enabled else "🔴 خاموش"
+    conn_label = "🟢 متصل به تبدیل" if ok else "🟡 در حال تلاش برای اتصال"
+    net_pct = GROSS_TARGET_PCT - ROUND_TRIP_FEE_PCT
 
-        curr_p_txt = get_current_symbol_price_formatted(best_sym)
-        spend_irt = round(balance_irt * TRADE_ALLOCATION_PCT, 0)
-        if spend_irt <= 0:
-            return
-
-        eff_irt = spend_irt * (1.0 - FEE_RATE)
-        qty = round(eff_irt / curr_p, 6)
-        if qty <= 0:
-            return
-
-        try:
-            execute_tabdeal_order(best_sym, "BUY", qty)
-        except Exception as e:
-            send_telegram_message(f"⚠️ خطا در ورود {best_sym}: <code>{e}</code>")
-            return
-
-        balance_irt -= spend_irt
-        trade_counter += 1
-        trade_type_label = f"چنج / خرید صعودی (LONG: تومان → {best_sym.replace('_IRT', '')})"
-        open_position = {
-            "id": trade_counter,
-            "symbol": best_sym,
-            "trade_type": trade_type_label,
-            "entry_price": curr_p,
-            "entry_price_txt": curr_p_txt,
-            "qty": qty,
-            "spent_irt": spend_irt,
-            "peak_pct": 0.0,
-            "opened_at": now_str,
-        }
-
-        tp_p = curr_p * (1.0 + TAKE_PROFIT_PCT / 100.0)
-        sl_p = curr_p * (1.0 + STOP_LOSS_PCT / 100.0)
-
-        send_telegram_message(
-            f"📥 <b>ورود هوشمند کوتاه #{trade_counter} | {best_sym}</b> [<code>{RUN_ID}</code>]\n"
-            f"• نوع معامله: <b>{trade_type_label}</b>\n"
-            f"• سرمایه فرضی تخصیص‌یافته: <b>{format_irt(spend_irt, None, with_unit=True)}</b>\n"
-            f"• مقدار خرید: <code>{qty}</code> | قیمت ورود (تومانی): <code>{curr_p_txt}</code>\n"
-            f"• امتیاز تکنیکال: <b>{best_score}</b> | کندل کوتاه: <code>{best_body:+.2f}%</code>\n"
-            f"• سیگنال: <i>{best_reason}</i>\n"
-            f"• هدف سود کوتاه: <code>{format_irt(tp_p, None, with_unit=True)}</code> ({TAKE_PROFIT_PCT:+.2f}%) | "
-            f"حد ضرر: <code>{format_irt(sl_p, None, with_unit=True)}</code> ({STOP_LOSS_PCT:+.2f}%)\n"
-            f"• موجودی فرضی باقی‌مانده: <b>{format_irt(balance_irt, None, with_unit=True)}</b>"
-        )
-
-
-def build_status_text():
-    with state_lock:
-        total_pnl = sum(t["profit_irt"] for t in closed_trades)
-        wins = sum(1 for t in closed_trades if t["profit_irt"] > 0)
-        total_closed = len(closed_trades)
-        win_rate = (wins / total_closed * 100.0) if total_closed > 0 else 0.0
-        eq = get_total_equity_irt()
-        ret_pct = ((eq - INITIAL_IRT_BALANCE) / INITIAL_IRT_BALANCE) * 100.0
-
-        if not trading_enabled:
-            mode_s = "🔴 متوقف"
-        elif auto_paused_risk:
-            mode_s = "🟡 مکث محافظتی ریسک"
-        else:
-            mode_s = "🟢 روشن (هوشمند کوتاه تومانی)"
-
-        live_s = "فعال (واقعی)" if LIVE_TRADING else "تست ایمن (موجودی فرضی)"
-        feed_s = "پشتیبان فعال" if using_fallback_feed else "زنده تبدیل"
-        pos_s = f"بله ({open_position['symbol']} | LONG/چنج)" if open_position else "خیر"
-        cd_s = f"{cooldown_remaining} دوره" if cooldown_remaining > 0 else "خیر"
-        max_fast = max((len(market_state[s]["fast_candles"]) for s in IRT_SYMBOLS), default=0)
-
-        return (
-            f"📊 <b>وضعیت ربات هوشمند تریدر تبدیل (تومانی)</b> [<code>{RUN_ID}</code>]\n"
-            f"• وضعیت ترید: <b>{mode_s}</b> | سفارش: <b>{live_s}</b>\n"
-            f"• فید قیمت: <b>{feed_s}</b> | کندل کوتاه: <b>{max_fast}</b>\n"
-            f"• موجودی فرضی نقد: <b>{format_irt(balance_irt, None, with_unit=True)}</b>\n"
-            f"• ارزش کل دارایی فرضی: <b>{format_irt(eq, None, with_unit=True)}</b> (<code>{ret_pct:+.2f}%</code>)\n"
-            f"• سود/ضرر خالص بسته: <code>{format_irt(total_pnl, None, with_unit=True)}</code>\n"
-            f"• نرخ برد: <b>{wins}/{total_closed}</b> (<code>{win_rate:.1f}%</code>) | ضرر پی‌درپی: <b>{consecutive_losses}</b>\n"
-            f"• استراحت پس از ضرر: <b>{cd_s}</b> | پوزیشن باز: <b>{pos_s}</b>"
-        )
-
-
-def build_stats_text():
-    with state_lock:
-        tot = len(closed_trades)
-        wins = [t for t in closed_trades if t["profit_irt"] > 0]
-        losses = [t for t in closed_trades if t["profit_irt"] < 0]
-        net_pnl = sum(t["profit_irt"] for t in closed_trades)
-        avg_pnl = (net_pnl / tot) if tot > 0 else 0.0
-        avg_win = (sum(t["profit_irt"] for t in wins) / len(wins)) if wins else 0.0
-        avg_loss = (sum(t["profit_irt"] for t in losses) / len(losses)) if losses else 0.0
-        win_rate = (len(wins) / tot * 100.0) if tot > 0 else 0.0
-        return (
-            f"📈 <b>آمار دقیق معاملات هوشمند تومانی (LONG/چنج)</b> [<code>{RUN_ID}</code>]\n"
-            f"• سرمایه فرضی اولیه: <b>{format_irt(INITIAL_IRT_BALANCE, None, with_unit=True)}</b>\n"
-            f"• کل معاملات بسته: <b>{tot}</b> | سودده: <b>{len(wins)}</b> | زیان‌ده: <b>{len(losses)}</b>\n"
-            f"• نرخ برد: <b>{win_rate:.1f}%</b>\n"
-            f"• سود/ضرر خالص کل: <code>{format_irt(net_pnl, None, with_unit=True)}</code>\n"
-            f"• میانگین هر معامله: <code>{format_irt(avg_pnl, None, with_unit=True)}</code>\n"
-            f"• میانگین سودده: <code>{format_irt(avg_win, None, with_unit=True)}</code> | میانگین زیان‌ده: <code>{format_irt(avg_loss, None, with_unit=True)}</code>"
-        )
-
-
-def build_positions_text():
-    with state_lock:
-        if not open_position:
-            return f"🔒 در حال حاضر پوزیشن بازی روی بازارهای تومانی وجود ندارد. [<code>{RUN_ID}</code>]"
-        sym = open_position["symbol"]
-        curr_p = get_current_symbol_price(sym) or open_position["entry_price"]
-        curr_p_txt = get_current_symbol_price_formatted(sym)
-        entry_p = open_position["entry_price"]
-        entry_p_txt = open_position.get("entry_price_txt") or format_irt(entry_p, None, with_unit=True)
-        pnl_pct = ((curr_p - entry_p) / entry_p) * 100.0
-        peak_pct = open_position.get("peak_pct", pnl_pct)
-        return (
-            f"🔓 <b>پوزیشن باز #{open_position['id']} | {sym}</b> [<code>{RUN_ID}</code>]\n"
-            f"• نوع معامله: <b>{open_position.get('trade_type', 'چنج / خرید صعودی (LONG)')}</b>\n"
-            f"• سرمایه فرضی درگیر: <b>{format_irt(open_position['spent_irt'], None, with_unit=True)}</b>\n"
-            f"• قیمت ورود (تومانی): <code>{entry_p_txt}</code>\n"
-            f"• قیمت فعلی (تومانی): <code>{curr_p_txt}</code>\n"
-            f"• سود/ضرر شناور: <code>{pnl_pct:+.2f}%</code> (اوج: <code>{peak_pct:+.2f}%</code>)"
-        )
-
-
-def build_history_text():
-    with state_lock:
-        if not closed_trades:
-            return f"📭 هنوز معامله بسته‌شده‌ای ثبت نشده است. [<code>{RUN_ID}</code>]"
-        recent = closed_trades[-6:]
-        lines = [f"📜 <b>آخرین {len(recent)} معامله هوشمند تومانی (LONG/چنج)</b> [<code>{RUN_ID}</code>]"]
-        for t in reversed(recent):
-            in_txt = t.get("entry_price_txt") or format_irt(t["entry_price"], None, with_unit=True)
-            out_txt = t.get("exit_price_txt") or format_irt(t["exit_price"], None, with_unit=True)
-            lines.append(
-                f"• #{t['id']} <b>{t['symbol']}</b> | ورود: <code>{in_txt}</code> → خروج: <code>{out_txt}</code> | "
-                f"خالص: <code>{format_irt(t['profit_irt'], None, with_unit=True)}</code> (<code>{t['pnl_pct']:+.2f}%</code>)"
-            )
-        return "\n".join(lines)
-
-
-def build_prices_text():
-    fetch_irt_prices_map()
-    with state_lock:
-        lines = [
-            f"💰 <b>قیمت ارزهای تومانی در موتور ترید ({len(IRT_SYMBOLS)} بازار)</b> [<code>{RUN_ID}</code>]"
-        ]
-        for sym in IRT_SYMBOLS:
-            p_txt = get_current_symbol_price_formatted(sym)
-            lines.append(f"• <b>{sym}</b>: <code>{p_txt}</code>")
-        return "\n".join(lines)
-
-
-def build_market_text():
-    with state_lock:
-        lines = [
-            f"💹 <b>وضعیت بازارهای تومانی ({len(IRT_SYMBOLS)} بازار)</b> [<code>{RUN_ID}</code>]"
-        ]
-        for sym in IRT_SYMBOLS[:20]:
-            p_txt = get_current_symbol_price_formatted(sym)
-            c_cnt = len(market_state[sym]["fast_candles"])
-            lines.append(f"• <b>{sym}</b>: <code>{p_txt}</code> | کندل کوتاه: <b>{c_cnt}</b>")
-        if len(IRT_SYMBOLS) > 20:
-            lines.append("<i>... برای دیدن همه قیمت‌ها دستور /prices را بفرستید.</i>")
-        return "\n".join(lines)
-
-
-def reset_simulation():
-    global balance_irt, open_position, closed_trades, trade_counter, cooldown_remaining, consecutive_losses, auto_paused_risk, day_start_equity
-    with state_lock:
-        balance_irt = INITIAL_IRT_BALANCE
-        open_position = None
-        closed_trades = []
-        trade_counter = 0
-        cooldown_remaining = 0
-        consecutive_losses = 0
-        auto_paused_risk = False
-        day_start_equity = INITIAL_IRT_BALANCE
+    return (
+        f"📊 <b>جزئیات کامل ربات سیگنال تبدیل</b> [<code>{RUN_ID}</code>]\n"
+        f"• وضعیت ربات: <b>{state_label}</b>\n"
+        f"• اتصال قیمت: <b>{conn_label}</b> ({priced}/{total_syms} بازار IRT)\n"
+        f"• منبع دریافت: <code>{info}</code>\n"
+        f"• کارمزد رفت‌وبرگشت لحاظ‌شده: <code>{ROUND_TRIP_FEE_PCT:.2f}%</code>\n"
+        f"• تارگت خروج: <code>+{GROSS_TARGET_PCT:.2f}%</code> | <b>سود خالص پس از کارمزد: +{net_pct:.2f}%</b>\n"
+        f"• حد ضرر پیشنهادی: <code>{STOP_LOSS_PCT:+.2f}%</code>\n"
+        f"• دستورها: <code>/start</code> | <code>/stop</code> | <code>/signal</code>"
+    )
 
 
 def handle_command(raw_text: str, chat_id: str):
-    global trading_enabled, auto_paused_risk
+    global signal_active
     cmd = raw_text.strip().split()[0].split("@")[0].lower()
 
-    if cmd in ("/start", "/help"):
+    if cmd == "/start":
+        with state_lock:
+            signal_active = True
         send_telegram_message(
-            f"🤖 <b>ربات هوشمند تریدر تومانی</b> [<code>{RUN_ID}</code>]\n"
-            "• /trade_on — شروع و ازسرگیری ترید هوشمند\n"
-            "• /trade_off — قطع فوری ترید\n"
-            "• /status — وضعیت کلی، موجودی فرضی و کندل‌ها\n"
-            "• /stats — آمار دقیق سود/ضرر، نرخ برد و میانگین‌ها\n"
-            "• /positions — پوزیشن باز فعلی و قیمت ورود/فعلی تومانی\n"
-            "• /history — آخرین معاملات بسته با قیمت ورود و خروج تومانی\n"
-            "• /market — خلاصه وضعیت بازارهای تومانی\n"
-            "• /prices — لیست قیمت‌های فعال در موتور ترید\n"
-            "• /reset — ریست موجودی فرضی به 10,000,000 تومان",
+            f"🚀 <b>ربات سیگنال‌دهنده تبدیل روشن شد و سیگنال‌گیری آغاز گردید!</b> [<code>{RUN_ID}</code>]\n\n"
+            + build_status_details(),
             chat_id,
         )
-    elif cmd in ("/prices", "/price"):
-        send_telegram_message(build_prices_text(), chat_id)
-    elif cmd in ("/trade_on", "/run"):
+        scan_and_dispatch_signals(manual=True)
+
+    elif cmd == "/stop":
         with state_lock:
-            trading_enabled = True
-            auto_paused_risk = False
-        send_telegram_message(f"🟢 ترید هوشمند تومانی فعال شد. [<code>{RUN_ID}</code>]", chat_id)
-    elif cmd in ("/trade_off", "/stop"):
-        with state_lock:
-            trading_enabled = False
-        send_telegram_message(f"🛑 ترید هوشمند تومانی متوقف شد. [<code>{RUN_ID}</code>]", chat_id)
-    elif cmd == "/status":
-        send_telegram_message(build_status_text(), chat_id)
-    elif cmd == "/stats":
-        send_telegram_message(build_stats_text(), chat_id)
-    elif cmd == "/positions":
-        send_telegram_message(build_positions_text(), chat_id)
-    elif cmd == "/history":
-        send_telegram_message(build_history_text(), chat_id)
-    elif cmd == "/market":
-        send_telegram_message(build_market_text(), chat_id)
-    elif cmd == "/reset":
-        reset_simulation()
+            signal_active = False
         send_telegram_message(
-            f"🔄 موجودی فرضی ریست شد: <b>{format_irt(INITIAL_IRT_BALANCE, None, with_unit=True)}</b> [<code>{RUN_ID}</code>]",
+            f"🛑 <b>ربات سیگنال‌دهنده تبدیل خاموش شد.</b> [<code>{RUN_ID}</code>]\n"
+            "برای شروع مجدد دستور <code>/start</code> را بفرستید.",
             chat_id,
         )
+
+    elif cmd == "/signal":
+        with state_lock:
+            is_on = signal_active
+        if not is_on:
+            send_telegram_message(
+                f"🔴 ربات در حال حاضر خاموش است. ابتدا <code>/start</code> را بزنید. [<code>{RUN_ID}</code>]",
+                chat_id,
+            )
+            return
+        sent = scan_and_dispatch_signals(manual=True)
+        if not sent:
+            send_telegram_message(
+                f"ℹ️ در حال حاضر قیمت زنده‌ای از تبدیل دریافت نشد؛ کمی بعد دوباره <code>/signal</code> بزنید. [<code>{RUN_ID}</code>]",
+                chat_id,
+            )
 
 
 def poll_telegram_updates():
@@ -1024,15 +604,18 @@ def ensure_polling_alive():
 
 def main_loop():
     send_telegram_message(
-        f"🚀 <b>ربات هوشمند تریدر تومانی آماده شد!</b> [<code>{RUN_ID}</code>]\n"
-        f"• تعداد بازارهای IRT تحت نظر: <b>{len(IRT_SYMBOLS)} ارز</b>\n"
-        f"• سرمایه فرضی: <b>{format_irt(INITIAL_IRT_BALANCE, None, with_unit=True)}</b> | هدف سود کوتاه: <code>{TAKE_PROFIT_PCT:+.2f}%</code> | حد ضرر: <code>{STOP_LOSS_PCT:+.2f}%</code>\n"
-        f"• شروع ترید: <code>/trade_on</code> | قطع فوری: <code>/trade_off</code> | وضعیت: <code>/status</code>"
+        f"✅ <b>ربات سیگنال تبدیل آماده است.</b> [<code>{RUN_ID}</code>]\n"
+        "• <code>/start</code> — شروع فوری سیگنال‌گیری و جزئیات کامل\n"
+        "• <code>/stop</code> — خاموش کردن ربات\n"
+        "• <code>/signal</code> — بررسی فوری بازارهای تومانی و اعلام سود خالص تا تارگت"
     )
     while True:
         ensure_polling_alive()
         try:
-            process_trading_step()
+            with state_lock:
+                active = signal_active
+            if active:
+                scan_and_dispatch_signals(manual=False)
         except Exception as e:
             print("Main loop error:", e)
         time.sleep(SAMPLE_SECONDS)
