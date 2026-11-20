@@ -219,7 +219,6 @@ def fetch_irt_prices_map():
         last_price_diag = "TABDEAL_API_KEY / TABDEAL_API_SECRET تنظیم نشده است"
         return prices
 
-    # ۱. متدهای احتمالی دریافت لیست یا قیمت همه بازارها بدون پارامتر
     bulk_candidates = [
         "get_ticker", "ticker", "get_all_tickers", "tickers", "get_24hr_ticker",
         "get_markets", "markets", "get_symbols", "get_exchange_info", "exchange_info"
@@ -235,7 +234,6 @@ def fetch_irt_prices_map():
             except Exception as e:
                 diag_notes.append(f"{name}: {type(e).__name__}: {str(e)[:45]}")
 
-    # ۲. اگر لیست کلی قیمتی نداد، متدهای تک‌نمادی را برای ارزهای تومانی امتحان می‌کنیم
     if not prices:
         single_candidates = [
             "get_ticker_price", "ticker_price", "get_order_book", "order_book",
